@@ -5,6 +5,21 @@ from six import iteritems, iterkeys
 from . import Node, Edge
 from .MatchLGQL import MatchLGQL, MatchCTX, QueryCannotMatch, eval_test
 
+def noop_scanner(entry):
+    pass
+
+class Once:
+    __slots__ = 'func', 'ret'
+
+    def __init__(self, func):
+        self.func = func
+
+    def __call__(self):
+        if self.func is not None:
+            self.ret = self.func()
+            self.func = None
+        return self.ret
+
 class Query(object):
     magic = {
         'N': {
@@ -145,24 +160,17 @@ class Query(object):
 
         self.handlers = self.cache[('h',) + self.patterns] = handlers
 
-    def _starts(self, txn, start, stop, scanner=None):
-        handlers = self.handlers
-        for entry in txn.scan(start=start, stop=stop):
-            if scanner is not None:
-                scanner(entry)
-            try:
-                for x in handlers[entry.code](entry):
-                    yield x
-            except KeyError:
-                pass
-
-    def _adhoc(self, txn, stop, limit):
+    def _adhoc(self, txn, stop=0, snap=False):
         for p_idx, c in enumerate(self.compiled):
             if c is None:
                 continue
             ctx = MatchCTX(c)
             p = self.patterns[p_idx]
-            for seed in c.seeds(txn, beforeID=(stop+1) if stop else None):
+            if snap:
+                beforeID = txn._snap(stop)
+            else:
+                beforeID = (stop + 1) if stop else None
+            for seed in c.seeds(txn, beforeID=beforeID):
                 yield (p, ctx.matches(seed, idx=c.best))
 
     def validate(self, *chains):
@@ -192,17 +200,45 @@ class Query(object):
                 if valid:
                     yield p, chain
 
-    def _streaming(self, txn, start, stop, limit, scanner):
+    def _starts(self, txn, scanner=noop_scanner, **kwargs):
+        handlers = self.handlers
+        for entry in txn.scan(**kwargs):
+            if scanner(entry):
+                return
+            try:
+                for target, tocs in handlers[entry.code](entry):
+                    yield entry.ID, target, tocs
+            except KeyError:
+                pass
+
+    def _update_seen(self, matches, seen, sk):
+        for m in matches:
+            seen.add(sk)
+            yield m
+
+    def _streaming(self, txn, snap=False, **kwargs):
         self._gen_handlers()
         ctxs = {}
-        for target, tocs in self._starts(txn, start=start, stop=stop, scanner=scanner):
+        beforeID = 1 if snap else None
+        seen = set() if snap else None
+        for ID, target, tocs in self._starts(txn, **kwargs):
+            if snap and ID >= beforeID:
+                beforeID = txn._snap(ID)
+                seen.clear()
             for p_idx, idx in tocs:
+                if snap:
+                    sk = target.ID, p_idx, idx
+                    if sk in seen:
+                        continue
                 p = self.patterns[p_idx]
                 try:
                     ctx = ctxs[p]
                 except KeyError:
                     ctx = ctxs[p] = MatchCTX(self.compiled[p_idx])
-                yield (p, ctx.matches(target, idx=idx))
+                matches = ctx.matches(target, idx=idx, beforeID=beforeID)
+                if snap:
+                    matches = self._update_seen(matches, seen, sk)
+                yield (p, matches)
 
     def _exec(self, pat_matches):
         for p, matches in pat_matches:
@@ -218,9 +254,9 @@ class Query(object):
                 else:
                     return
 
-    def execute(self, txn, start=0, stop=0, limit=0, scanner=None):
+    def execute(self, txn, start=0, limit=0, **kwargs):
         limit = int(limit)
-        pat_matches = self._streaming(txn, start, stop, limit, scanner) if start else self._adhoc(txn, stop, limit)
+        pat_matches = self._streaming(txn, start=start, **kwargs) if start else self._adhoc(txn, **kwargs)
         return self._exec_limit(pat_matches, limit) if limit else self._exec(pat_matches)
 
     def _scan_static(self, trigs, entry, seen):
@@ -232,8 +268,9 @@ class Query(object):
                     yield (entry, unseen)
 
     def _scan_mutable(self, trigs, entry, seen, beforeID):
+        prev = Once(lambda: entry.clone(beforeID=beforeID))
         for test, tocs in iteritems(trigs):
-            if eval_test(entry, test) and not eval_test(entry.clone(beforeID=beforeID), test):
+            if eval_test(entry, test, prev=prev):
                 unseen = tocs - seen
                 if unseen:
                     seen |= unseen
@@ -244,6 +281,7 @@ class Query(object):
             triggers = trigs[entry.key]
         except KeyError:
             return
+        prev = Once(lambda: entry.parent.clone(beforeID=entry.ID))
         for test, tocs in iteritems(triggers):
-            if eval_test(entry.parent, test) and not eval_test(entry.parent.clone(beforeID=entry.ID), test):
+            if eval_test(entry.parent, test, prev=prev):
                 yield (entry.parent, tocs)

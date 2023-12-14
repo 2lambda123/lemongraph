@@ -66,16 +66,16 @@ The Python wrapper provides a friendly interface:
 
 Note that the REST service cannot run on CentOS 6's Python 2.6, as we rely on the new `memoryview` magic.
 
-Python 3 should work now though - replace `python`/`pypy`/`easy_install` and package names with appropriate Python 3 variants.
+Python 3 should work now though - replace `python`/`pypy`/`pip` and package names with appropriate Python 3 variants.
 
 * CPython on CentOS 6/7:
 	* `yum install -y gcc gcc-c++ make libffi-devel zlib-devel python-devel python-setuptools`
-	* `easy_install 'cffi>=1.0'`
-* CPython on Ubuntu 15.04 - 16.04:
-	* `apt-get install libffi-dev zlib1g-dev python-dev python-cffi`
+	* `pip install 'cffi>=1.0'`
+* CPython on Ubuntu 15.04 - 20.04:
+	* `apt-get install gcc libffi-dev zlib1g-dev python-dev python-cffi`
 * CPython (compiled) - just bootstrap setuptools and install cffi:
 	* `python -mensurepip`
-	* `easy_install 'cffi>=1.0'`
+	* `pip install 'cffi>=1.0'`
 * Pypy - just bootstrap setuptools - cffi is bundled:
 	* `pypy -mensurepip`
 
@@ -84,9 +84,9 @@ Python 3 should work now though - replace `python`/`pypy`/`easy_install` and pac
 
 Or to run without proper installation, you must manually install dependencies:
 * CPython:
-	* `easy_install lazy msgpack pysigset python-dateutil six ujson`
+	* `pip install lazy msgpack python-dateutil six ujson`
 * Pypy:
-	* `easy_install lazy msgpack pysigset python-dateutil six`
+	* `pip install lazy msgpack python-dateutil six`
 
 # Python Example
 ```python
@@ -174,14 +174,26 @@ Snapshot a (potentially active) database:
 Run the REST service (use `-h` to list options):
 * `python -mLemonGraph.server <options>`
 
-The rest service maintains an indexed cache of basic graph information. Every _N_ milliseconds (`-d` option), it will check for and flush updated graphs to disk.
+It runs:
+* one master process responsible for [re]spawning and killing child processes
+* one socket pool process responsible for:
+	* accepting new connections
+	* monitoring idle connections
+	* distributing active connections to worker processes
+* one sync process responsible for sync-ing graphs to disk
+	* wakes once a second, sync-ing updated graphs that either:
+		* haven't been synced within the last 15 seconds, or
+		* haven't been updated within the last 5 seconds
+	* multi-threaded - currently set to use 32 threads
+* _N_ worker processes to handle http requests - see `-w` (default: number of detected cores)
 
 For greater throughput, use `-s` at the expense of possible data loss in the event of OS/hardware/power-related failure.
 
-By default, it will run:
-* one master process responsible for [re]spawning and killing child threads
-* one sync process responsible for syncing graphs to disk
-* _N_ (`-w`) worker processes to handle http requests
+Optionally feed it a path (default: 'graphs') to a directory to use to store individual graphs. It will be created if necessary.
+
+The rest service maintains an adjacent indexed cache of basic graph information (default 'graphs.idx'). Should it become corrupted, halt the rest service, remove the index, and it will be rebuilt on startup.
+
+See [RESTAPI.md](RESTAPI.md) documentation.
 
 # Query Language
 
@@ -227,7 +239,13 @@ Simple keys (consists entirely of 'word' characters, may not start w/ digit) may
 * string  - enclosed by quotes
 * boolean - case insensitive bareword 'true' or 'false'
 * null    - case insensitive bareword 'none' or 'null'
+* \* (literal asterisk)
+	* for streaming queries, detect change of key value
+	* for non-streaming queries, just test for key existance
+	* invalid inside a list
+	* invalid for `!=`
 
+ (not valid inside a list or for `!=`)
 ### Regular expression (`~`) (python flavored, in perl-style notation):
 * Evaluated using Python's `re` module
 * Formatted in Perl style, so we can add flags easily: `/pattern/flags`
@@ -305,3 +323,4 @@ To provide speedy operations, graph data is indexed several ways (we reserve the
 We also provide a non-logged domain/key => value storage interface. Domains are mapped to IDs using the above __scalar__ storage, and keys and values can be as well. Mapping keys and/or values can result in less overall storage, but anything mapped never truly goes away. For non-mapped keys, maximum key length is limited to about 500 bytes. Unlike the others, deletes may be performed against this table:
 
 * __kv__ - maps domain & optionally ID-mapped key tuple to optionally ID-mapped value
+* __kvbm__ - holds cursors for key/value domains - facilitates round-robin style access to kv domains

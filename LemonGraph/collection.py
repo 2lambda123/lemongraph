@@ -12,9 +12,9 @@ from time import sleep, time
 import uuid
 
 from lazy import lazy
-from pysigset import suspended_signals
 
-from . import Graph, Serializer, Hooks, dirlist, Indexer, Query
+from . import Graph, Serializer, Hooks, dirlist, Indexer, BaseIndexer, Query
+from .uuidgen import uuidgen
 
 try:
     xrange          # Python 2
@@ -24,14 +24,24 @@ except NameError:
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 
-def uuidgen():
-    return str(uuid.uuid1())
+idx_uuid = '00000000-0000-0000-0000-000000000000'
 
 def uuid_to_utc_ts(u):
-    return (uuid.UUID('{%s}' % u).time - 0x01b21dd213814000) // 1e7
+    return (uuid.UUID('{%s}' % u).time - 0x01b21dd213814000) / 1e7
 
 def uuid_to_utc(u):
     return datetime.datetime.utcfromtimestamp(uuid_to_utc_ts(u)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+def intersects(list1, list2):
+    if len(list2) > len(list1):
+        a = frozenset(list2)
+        b = list1
+    else:
+        a = frozenset(list1)
+        b = list2
+    for x in b:
+        if x in a:
+            return True
 
 class CollectionHooks(Hooks):
     def __init__(self, uuid, collection):
@@ -64,50 +74,128 @@ class StatusIndexer(Indexer):
         except (KeyError, AttributeError):
             return ()
 
-class StatusIndex(object):
-    domain = 'status'
-    null = Serializer.null()
-
+class BaseIndex(object):
     def __init__(self, ctx):
         self.ctx = ctx
-        self.indexer = StatusIndexer()
         self._indexes = {}
+
+class StatusIndex(BaseIndex):
+    indexer = StatusIndexer()
+    domain = 'status'
+    null = Serializer.null()
+    uuid = Serializer.uuid()
+
+    def index(self, idx):
+        try:
+            return self._indexes[idx]
+        except KeyError:
+            index = self._indexes[idx] = self.ctx.txn.sset('lg.collection.idx.%s.%s' % (self.domain, idx), serialize_value=self.null)
+        return index
 
     def update(self, uuid, old, new):
         oldkeys = self.indexer.index(old)
         newkeys = self.indexer.index(new)
-        uuid = uuid.encode()
+        uuid = self.uuid.encode(uuid)
         for name, crc in oldkeys.difference(newkeys):
-            keys = self._index(name)
+            keys = self.index(name)
             try:
                 keys.remove(crc + uuid)
             except KeyError:
                 pass
         for name, crc in newkeys.difference(oldkeys):
-            keys = self._index(name)
+            keys = self.index(name)
             keys.add(crc + uuid)
-
-    def _index(self, idx):
-        try:
-            return self._indexes[idx]
-        except KeyError:
-            self._indexes[idx] = self.ctx.txn.sset('lg.collection.idx.%s.%s' % (self.domain, idx), serialize_value=self.null)
-        return self._indexes[idx]
 
     def search(self, idx, value):
         idx, crc, check = self.indexer.prequery(idx, value)
         crclen = len(crc)
         try:
-            index = self._index(idx)
+            index = self.index(idx)
         except KeyError:
             return
         for key in index.iterpfx(pfx=crc):
-            uuid = key[crclen:].decode()
+            uuid = self.uuid.decode(key[crclen:])
             status = self.ctx.statusDB[uuid]
             if check(status):
                 yield uuid, status
 
+class LG_LiteIndexer(BaseIndexer):
+    def idx_adapters(self, obj):
+        try:
+            return obj['adapters']
+        except KeyError:
+            return ()
+
+    def key(self, name, value):
+        if isinstance(value, list):
+            value = tuple(value)
+        return (name,) + value
+
+class LG_LiteIndex(BaseIndex):
+    indexer = LG_LiteIndexer()
+    domain = "lg_lite"
+    uuid = Serializer.uuid()
+
+    def update(self, uuid, old, new):
+        oldkeys = self.indexer.index(old)
+        newkeys = self.indexer.index(new)
+
+        # keys should be ('adapters', <adaptername>, <query>, <priority>)
+        for _, adapter, query, pri in oldkeys.difference(newkeys):
+            assert _ == 'adapters'
+            aqb = '%s:%s' % (adapter, query)
+            pq = self.jobs(adapter, query)
+            pq.remove(uuid)
+            if pq.empty:
+                self.queries(adapter).remove(query)
+                del self.adapters[aqb]
+            else:
+                self.adapters[aqb] -= 1
+
+        for _, adapter, query, pri in newkeys.difference(oldkeys):
+            assert _ == 'adapters'
+            aqb = '%s:%s' % (adapter, query)
+            pq = self.jobs(adapter, query)
+            try:
+                self.adapters[aqb] += 1
+            except KeyError:
+                self.queries(adapter).add(query)
+                self.adapters[aqb] = 1
+            pq.add(uuid, priority=pri)
+
+    # list of active queries per adapter
+    def queries(self, adapter):
+        try:
+            return self._queries[adapter]
+        except KeyError:
+            ret = self.ctx.txn.sset('lg.collection.idx.%s.%s' % (self.domain, adapter), map_values=True)
+            self._queries[adapter] = ret
+            return ret
+
+    # priority queue of jobs per adapter/query pair
+    def jobs(self, adapter, query):
+        try:
+            return self._jobs[adapter, query]
+        except KeyError:
+            ret = self.ctx.txn.pqueue('lg.collection.pq.%s.%s.%s' % (self.domain, adapter, query), serialize_value=self.uuid)
+            self._jobs[adapter, query] = ret
+            return ret
+
+    @lazy
+    def _queries(self):
+        return {}
+
+    @lazy
+    def _jobs(self):
+        return {}
+
+    @lazy
+    def adapters(self):
+        return self.ctx.txn.kv('lg.collection.idx.adapters', map_keys=True, serialize_value=self.ctx.uint)
+
 class Context(object):
+    uuid = Serializer.uuid()
+
     def __init__(self, collection, write=True):
         self.db = collection.db
         self._graph = collection.graph
@@ -171,7 +259,11 @@ class Context(object):
         kwargs['ctx'] = self
         return self._graph(*args, **kwargs)
 
-    def _status_enrich(self, status, uuid):
+    def _status_enrich(self, status, uuid, user=None, roles=None):
+        if user is not None:
+            user_roles = status['roles'][user]
+            if roles is not None and not intersects(user_roles, roles):
+                raise KeyError
         output = { 'graph': uuid, 'id': uuid }
         try:
             output['meta'] = self.metaDB[uuid]
@@ -183,36 +275,35 @@ class Context(object):
         output['created'] = uuid_to_utc(uuid)
         return output
 
-    def status(self, uuid):
+    def status(self, uuid, **kwargs):
         try:
-            return self._status_enrich(self.statusDB[uuid], uuid)
+            return self._status_enrich(self.statusDB[uuid], uuid, **kwargs)
         except KeyError:
             pass
 
     def sync(self, uuid, txn):
         old_status, new_status = self._sync_status(uuid, txn)
         self.status_index.update(uuid, old_status, new_status)
+        self.lg_lite_index.update(uuid, old_status, new_status)
         self.metaDB[uuid] = txn.as_dict()
 
     @lazy
     def status_index(self):
         return StatusIndex(self)
 
+    @lazy
+    def lg_lite_index(self):
+        return LG_LiteIndex(self)
+
     def _sync_status(self, uuid, txn):
-        status = {'nextID': txn.nextID,
-                  'size': txn.graph.size,
-                  'nodes_count': txn.nodes_count(),
-                  'edges_count': txn.edges_count()}
-
-        try:
-            status['enabled'] = bool(txn['enabled'])
-        except KeyError:
-            status['enabled'] = True
-
-        try:
-            status['priority'] = sorted((0, int(txn['priority']), 255))[1]
-        except (KeyError, ValueError):
-            status['priority'] = 100
+        status = {
+            'nextID': txn.nextID,
+            'size': txn.graph.size,
+            'nodes_count': txn.nodes_count(),
+            'edges_count': txn.edges_count(),
+            'enabled': txn.enabled,
+            'priority': txn.priority,
+        }
 
         try:
             roles_graph = txn['roles']
@@ -225,18 +316,24 @@ class Context(object):
         except: # fixme
             pass
 
+        status['adapters'] = adapters = []
+        if status['enabled']:
+            priority = status['priority']
+            for flow in txn.lg_lite.flows(active=True):
+                adapters.append((flow.adapter, flow.query, priority))
+
         try:
             old_status = self.statusDB[uuid]
         except KeyError:
             old_status = None
         self.statusDB[uuid] = status
-
         return old_status, status
 
     def remove(self, uuid):
         try:
             status = self.statusDB.pop(uuid)
             self.status_index.update(uuid, status, None)
+            self.lg_lite_index.update(uuid, status, None)
         except KeyError:
             pass
         try:
@@ -245,27 +342,19 @@ class Context(object):
             pass
 
     @lazy
-    def updatedDB(self):
-        return self.txn.fifo('lg.collection.updated')
-
-    @lazy
-    def updatedDB_idx(self):
-        return self.txn.kv('lg.collection.updated_idx', serialize_value=self.msgpack)
-
-    @lazy
     def statusDB(self):
-        return self.txn.kv('lg.collection.status', serialize_value=self.msgpack)
+        return self.txn.kv('lg.collection.status', serialize_key=self.uuid, serialize_value=self.msgpack)
 
     @lazy
     def metaDB(self):
-        return self.txn.kv('lg.collection.meta', serialize_value=self.msgpack)
+        return self.txn.kv('lg.collection.meta', serialize_key=self.uuid, serialize_value=self.msgpack)
 
 
 class Collection(object):
     # increment on index structure changes
     VERSION = 2
 
-    def __init__(self, dir, graph_opts=None, create=True, rebuild=False, **kwargs):
+    def __init__(self, dir, graph_opts=None, create=True, rebuild=False, syncd=None, **kwargs):
         self.db = None
         if create:
             try:
@@ -274,10 +363,14 @@ class Collection(object):
                 if e.errno != errno.EEXIST or not os.path.isdir(dir):
                     raise
         self.dir = os.path.abspath(dir)
+        self.syncd = syncd
         idx = "%s.idx" % self.dir
         self.graph_opts = {} if graph_opts is None else graph_opts
+        self.notls = kwargs.get('notls', False)
         kwargs['serialize_property_value'] = self.msgpack
         kwargs['create'] = create
+        if rebuild:
+            os.remove(idx)
         self.db = Graph(idx, **kwargs)
         if not rebuild:
             with self.context(write=False) as ctx:
@@ -343,17 +436,16 @@ class Collection(object):
                 try:
                     ctx.sync(uuid, txn)
                 finally:
-                    try:
-                        if uuid in ctx.updatedDB_idx:
-                            return
-                    except KeyError:
-                        pass
-                    ctx.updatedDB.push(uuid)
-                    ctx.updatedDB_idx[uuid] = time()
+                    if self.syncd is not None:
+                        self.syncd.queue(uuid)
+                        self.syncd.queue(idx_uuid)
 
     def remove(self, uuid):
         with self.context(write=True) as ctx:
             ctx.remove(uuid)
+            if self.syncd is not None:
+                self.syncd.unqueue(uuid)
+                self.syncd.queue(idx_uuid)
 
     def drop(self, uuid):
         path = self.graph_path(uuid)
@@ -381,6 +473,8 @@ class Collection(object):
                 kwargs[k] = v
         if hook:
             kwargs['hooks'] = CollectionHooks(uuid, self)
+        if 'notls' not in kwargs:
+            kwargs['notls'] = self.notls
         try:
             g = Graph(self.graph_path(uuid), **kwargs)
         except:
@@ -414,11 +508,11 @@ class Collection(object):
 
     @lazy
     def _words(self):
-        return re.compile('\w+')
+        return re.compile(r'\w+')
 
-    def status(self, uuid):
+    def status(self, uuid, **kwargs):
         with self.context(write=False) as ctx:
-            return ctx.status(uuid)
+            return ctx.status(uuid, **kwargs)
 
     def graphs(self, enabled=None):
         with self.context(write=False) as ctx:
@@ -430,77 +524,6 @@ class Collection(object):
 
     def context(self, write=True):
         return Context(self, write=write)
-
-    def daemon(self, poll=250, maxopen=1000):
-        poll /= 1000.0
-        ticker = self.ticker()
-        todo = deque()
-
-        # count fds in use - just check first 100 or so
-        pad = 0
-        for fd in xrange(0, 100):
-            try:
-                os.fstat(fd)
-                pad += 1
-            except:
-                pass
-
-        # check limits
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if maxopen + pad > soft:
-            soft = min(maxopen + pad, hard)
-            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-            maxopen = soft - pad
-
-        map_age = 0
-        log.info('using %d max open graphs' % maxopen)
-        while True:
-            next(ticker)
-            sleep(poll)
-            map_age += poll
-            if map_age >= 60:
-                self.db.remap()
-                map_age = 0
-            self.db.sync(force=True)
-            with self.context(write=False) as ctx:
-                try:
-                    if ctx.updatedDB.empty:
-                        continue
-                except KeyError:
-                    continue
-
-            # Note - we assume user is not using DB_WRITEMAP which is reasonable because:
-            #   LemonGraph explicitly disables that
-            # Otherwise, we might have to mmap the whole region and msync it - maybe?
-            # Opening it via LemonGraph adds overhead, burns double the file descriptors, and
-            # currently explodes if I try to set RLIMIT_NOFILE > 2050. I know not why.
-            # We also assume that fdatasync() is good, which it is for Linux >= 3.6
-            count = 0
-            backlog = True
-            while backlog:
-                with suspended_signals(signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                    try:
-                        log.debug("syncing")
-                        with self.context(write=True) as ctx:
-                            uuids = ctx.updatedDB.pop(n=maxopen)
-                            for uuid in uuids:
-                                age = ctx.updatedDB_idx.pop(uuid)
-                                try:
-                                    fd = os.open(self.graph_path(uuid), os.O_RDONLY)
-                                    todo.append(fd)
-                                except OSError as e:
-                                    # may have been legitimately deleted already
-                                    if e.errno != errno.ENOENT:
-                                        log.warning('error syncing graph %s: %s', uuid, str(e))
-                            count += len(uuids)
-                            backlog = len(ctx.updatedDB)
-                        for fd in todo:
-                            os.fdatasync(fd)
-                    finally:
-                        for fd in todo:
-                            os.close(fd)
-                        todo.clear()
-                log.info("synced %d, backlog %d, age %.1fs", count, backlog, time() - age)
 
     @lazy
     def msgpack(self):
@@ -520,3 +543,4 @@ class Collection(object):
             for x in strings:
                 fh.write(x)
                 yield
+

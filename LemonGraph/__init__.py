@@ -15,19 +15,23 @@ except ImportError:
     import builtins as builtin
 
 from collections import deque
+import datetime
 import itertools
 from lazy import lazy
 import os
 from six import iteritems, itervalues
 import sys
 
+from .version import VERSION as __version__
 from .callableiterable import CallableIterableMethod
 from .hooks import Hooks
 from .dirlist import dirlist
-from .indexer import Indexer
+from .indexer import Indexer, BaseIndexer
 from .MatchLGQL import QueryCannotMatch, QuerySyntaxError
+from .lg_lite import LG_Lite
 from . import algorithms
 from . import wire
+from . import unspecified
 
 # these imports happen at the bottom
 '''
@@ -36,6 +40,7 @@ from .query import Query
 from .fifo import Fifo
 from .serializer import Serializer
 from .sset import SSet
+from .pqueue import PQueue
 '''
 
 # so I can easily create keys/items/values class
@@ -82,7 +87,6 @@ def merge_values(a, b):
             pass
     return b
 
-
 class Graph(object):
     serializers = tuple('serialize_' + x for x in ('node_type', 'node_value', 'edge_type', 'edge_value', 'property_key', 'property_value'))
 
@@ -117,7 +121,7 @@ class Graph(object):
             raise IOError(ffi.errno, ffi.string(lib.graph_strerror(ffi.errno)))
         self._path = os.path.abspath(path)
         self.nosubdir = nosubdir
-        self.adapters = adapters
+        self._inline_adapters = adapters
         self._hooks = hooks
         self._hooks.opened(self)
 
@@ -177,6 +181,10 @@ class Graph(object):
     def path(self):
         return self._path
 
+    @builtin.property
+    def fd(self):
+        return lib.graph_fd(self._graph)
+
 
 class SnapshotIterator(object):
     def __init__(self, graph, bs=10485760, compact=True):
@@ -223,7 +231,7 @@ class GraphItem(object):
 
     # fetch Buffer for given ID - do not use resulting buffer outside of the transaction
     # it was obtained in, or after a potential modification (new nodes/edges/properties, etc)
-    def string(self, ID):
+    def string(self, ID, update=False):
         size = ffi.new('size_t *')
         buffer = lib.graph_string(self._txn, ID, size)
         return ffi.buffer(buffer, size[0])[:]
@@ -314,6 +322,7 @@ class CommitTransaction(EndTransaction):
 
 class Transaction(GraphItem):
     reserved = ()
+    ID = 0
 
     # only use a transaction from within the creating thread, unless txn is readonly and DB_NOTLS was specified
     def __init__(self, graph, write=True, beforeID=None, _parent=None):
@@ -325,7 +334,7 @@ class Transaction(GraphItem):
         self._parent = ffi.NULL if _parent is None else _parent
         self._txn = None
         self.txn_flags = 0 if write else lib.DB_RDONLY
-        self.adapters = graph.adapters if write else None
+        self._inline_adapters = graph._inline_adapters if write else None
 
     # create a child transaction - not possible if DB_WRITEMAP was enabled (it is disabled)
     def transaction(self, write=None, beforeID=None):
@@ -346,9 +355,11 @@ class Transaction(GraphItem):
         return lib.graph_txn_updated(self._txn)
 
     def flush(self, updated=False):
-        if (updated or self.updated) and self.adapters is not None and self.nextID > self._flushID:
+        if (updated or self.updated) and self._inline_adapters is not None and self.nextID > self._flushID:
             # exercise inline graph adapters
-            self.adapters.update(self, self._flushID)
+            self._timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+            self._inline_adapters.update(self, self._flushID)
+            del self._timestamp
             self._flushID = self.nextID
 
     def reset(self):
@@ -359,6 +370,7 @@ class Transaction(GraphItem):
     def _commit(self):
         if self.updated:
             self.flush(updated=True)
+            self.lg_lite.ffwd(start=self._startID)
             updates = self.nextID - self._startID
             err = lib.graph_txn_commit(self._txn)
             if err:
@@ -450,15 +462,26 @@ class Transaction(GraphItem):
 
     # return edges iterator, optionally for a specific type
     def edges(self, **kwargs):
-        by_type = bool('type' in kwargs)
-        type = kwargs.pop('type', None)
+        by_type = by_type_value = False
+        try:
+            type = kwargs.pop('type')
+            by_type = True
+            value = kwargs.pop('value')
+            by_type_value = True
+        except KeyError:
+            pass
+
         beforeID = kwargs.pop('beforeID', None)
         if kwargs:
             raise TypeError('got an unexpected keyword argument[s]: {}'.kwargs.keys())
 
         if by_type:
             type = self.serialize_edge_type.encode(type)
-            ret = Iterator(self, lib.graph_edges_type, lib.iter_next_edge, args=(type, len(type)), beforeID=self.b4ID(beforeID))
+            if by_type_value:
+                value = self.serialize_edge_value.encode(value)
+                ret = Iterator(self, lib.graph_edges_type_value, lib.iter_next_edge, args=(type, len(type), value, len(value)), beforeID=self.b4ID(beforeID))
+            else:
+                ret = Iterator(self, lib.graph_edges_type, lib.iter_next_edge, args=(type, len(type)), beforeID=self.b4ID(beforeID))
         else:
             ret = Iterator(self, lib.graph_edges, lib.iter_next_edge, beforeID=self.b4ID(beforeID))
         return ret
@@ -533,6 +556,13 @@ class Transaction(GraphItem):
             kwargs['serialize_value'] = serialize_value
         return SSet(self, domain, map_values=map_values, **kwargs)
 
+    def pqueue(self, domain, map_values=False, serialize_value=None):
+        """domain-specific priority queue"""
+        kwargs = {}
+        if serialize_value:
+            kwargs['serialize_value'] = serialize_value
+        return PQueue(self, domain, map_values=map_values, **kwargs)
+
     def fifo(self, domain, map_values=False, serialize_value=None):
         """domain-specific fifo"""
         kwargs = {}
@@ -576,16 +606,55 @@ class Transaction(GraphItem):
             before_after_keys.append(ID)
             yield tuple(before_after_keys)
 
-    def query(self, pattern, start=0, stop=0, cache=None, limit=0):
-        q = Query((pattern,), cache={} if cache is None else cache)
-        def just_chain():
-            for _, chain in q.execute(self, start=start, stop=stop, limit=limit):
-                yield chain
-        return just_chain()
+    def query(self, pattern, cache=None, **kwargs):
+        q = Query((pattern,), cache=cache)
+        for _, chain in q.execute(self, **kwargs):
+            yield chain
 
-    def mquery(self, patterns, start=0, stop=0, cache=None, limit=0):
-        q = Query(patterns, cache={} if cache is None else cache)
-        return q.execute(self, start=start, stop=stop, limit=limit)
+    def mquery(self, patterns, cache=None, **kwargs):
+        q = Query(patterns, cache=cache)
+        return q.execute(self, **kwargs)
+
+    # fetch numeric ID for binary buffer
+    def stringID(self, data, update=unspecified):
+        # default to txn read/write setting, allow 'update' param to override
+        if update is unspecified:
+            update = self.write
+        ID = ffi.new('strID_t *')
+        resolve = lib.graph_string_resolve if update else lib.graph_string_lookup
+        if resolve(self._txn, ID, data, len(data)):
+            return ID[0]
+        raise KeyError(data)
+
+    @lazy
+    def lg_lite(self):
+        return LG_Lite(self)
+
+    @builtin.property
+    def enabled(self):
+        try:
+            return bool(self['enabled'])
+        except KeyError:
+            return True
+
+    @enabled.setter
+    def enabled(self, val):
+        self['enabled'] = bool(val)
+
+    # priority [0..255], higher number is higher priority
+    @builtin.property
+    def priority(self):
+        try:
+            return sorted((0, int(self['priority']), 255))[1]
+        except (KeyError, ValueError):
+            return 100
+
+    @priority.setter
+    def priority(self, val):
+        self['priority'] = sorted((0, int(val), 255))[1]
+
+    def _snap(self, ID):
+        return lib.graph_snap_id(self._txn, ID)
 
 
 class NodeEdgeProperty(GraphItem):
@@ -707,16 +776,26 @@ class NativeProperty(object):
 class Deletion(NodeEdgeProperty):
     code = 'D'
     is_deletion = True
+    discoverable = ('ID', 'targetID')
 
     def delete(self):
         raise AttributeError("cannot delete")
 
     @builtin.property
-    def target(self):
+    def targetID(self):
         return self.next
+
+    @builtin.property
+    def target(self):
+        return self.txn.entry(self.next, beforeID=self.ID)
 
     def dump(self):
         return self.ID, (self.code, self.next)
+
+    def properties(self, handler=None):
+        if handler is None:
+            return iter(self.discoverable)
+        return (handler(NativeProperty(self, x)) for x in self.discoverable)
 
 
 class Node(NodeEdgeProperty):
@@ -1093,3 +1172,4 @@ from .query import Query
 from .fifo import Fifo
 from .serializer import Serializer
 from .sset import SSet
+from .pqueue import PQueue

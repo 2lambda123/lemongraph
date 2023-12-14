@@ -1,31 +1,35 @@
-PYTHON=python
+SHELL:=/bin/bash
+PYTHON:=$(firstword $(shell type -p python3 python 2>/dev/null))
 PYTHON_CFLAGS=-O3 -Wall
 CC+=-pipe
 CFLAGS=-fPIC -Wall -Wunused-variable -Wunused-but-set-variable -O3
-CPPFLAGS+=-Ideps/lmdb/libraries/liblmdb -Ilib
-VPATH=lib:deps/lmdb/libraries/liblmdb
+LMDB:=deps/lmdb/libraries/liblmdb
+CPPFLAGS+=-I$(LMDB) -Ilib
+VPATH=lib:$(LMDB)
 SNAPSHOT:=lg-$(shell date +%Y%m%d)
 
 default: build
 
-liblemongraph.a:  mdb.o midl.o lemongraph.o db.o
-liblemongraph.so: mdb.o midl.o lemongraph.o db.o
+liblemongraph.a:  mdb.o midl.o lemongraph.o db.o counter.o afsync.o avl.o logging.o
+liblemongraph.so: mdb.o midl.o lemongraph.o db.o counter.o afsync.o avl.o logging.o
 liblemongraph.so: LDFLAGS=-pthread
 liblemongraph.so: LDLIBS=-lz
+$(LMDB)/mdb.c:    deps
+$(LMDB)/midl.c:   deps
+db.o:             deps
 
 clean:
-	@echo $(wildcard *.a *.so *.o *.pyc LemonGraph/*.pyc LemonGraph/*/*.pyc LemonGraph/*.so MANIFEST) | xargs --no-run-if-empty rm -v
-	@echo $(wildcard .eggs build dist LemonGraph/__pycache__ LemonGraph/*/__pycache__ LemonGraph.egg-info)  | xargs --no-run-if-empty rm -rv
+	@find . -type d \( -name __pycache__ -o -name .eggs -o -name build -o -name dist -o -name \*.egg-info \) -exec rm -rf {} \; -print -prune
+	@find . -type f \( -name \*.pyc -o -name MANIFEST -o -name \*.o -o -name \*.a -o -name \*.so \) -delete -print
 
 distclean: clean
-	@find deps -mindepth 2 -maxdepth 2 -exec rm -rv {} \;
+	@find ./deps -mindepth 1 -maxdepth 1 -type d -exec find {} -mindepth 1 -delete \; -delete -print
 
 deps:
-	@CFLAGS="$(PYTHON_CFLAGS)" $(PYTHON) setup.py check
+	@$(MAKE) -C deps --no-print-directory
 
 deps-update:
-	@git submodule init
-	@git submodule update --remote
+	@$(MAKE) -C deps --no-print-directory update
 
 build:
 	CFLAGS="$(PYTHON_CFLAGS)" $(PYTHON) setup.py build
@@ -39,13 +43,15 @@ install:
 uninstall:
 	CFLAGS="$(PYTHON_CFLAGS)" $(PYTHON) setup.py uninstall
 
-sdist:
+sdist: deps
 	CFLAGS="$(PYTHON_CFLAGS)" $(PYTHON) setup.py sdist
 
-snapshot:
+snapshot: deps
 	@rm -rf $(SNAPSHOT) $(SNAPSHOT).zip
 	@git clone . $(SNAPSHOT)
-	@$(MAKE) -C $(SNAPSHOT) deps
+	@cp -a deps/. $(SNAPSHOT)/deps/.
+	@cd $(SNAPSHOT) && git remote remove origin
+	@rm -rf $(SNAPSHOT)/.git/logs
 	@zip -q -r9 $(SNAPSHOT).zip $(SNAPSHOT)
 	@rm -rf $(SNAPSHOT)
 	@echo $(SNAPSHOT).zip

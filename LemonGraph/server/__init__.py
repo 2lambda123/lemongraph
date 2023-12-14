@@ -1,6 +1,5 @@
 from __future__ import print_function
 
-import atexit
 from collections import deque, namedtuple
 import dateutil.parser
 import errno
@@ -11,18 +10,22 @@ import msgpack
 import os
 import pkg_resources
 import re
-from six import iteritems, itervalues
+from six import iteritems, itervalues, string_types
 from six.moves.urllib_parse import parse_qs
+from six.moves import map
 import sys
 import tempfile
 import time
 import traceback
-from uuid import uuid1 as uuidgen
 
-from .. import Serializer, Node, Edge, QuerySyntaxError, merge_values
-from ..collection import Collection, uuid_to_utc
+from .. import Serializer, Node, Edge, Transaction, QuerySyntaxError, merge_values
+from ..collection import Collection, uuid_to_utc, uuid_to_utc_ts
+from ..MatchLGQL import MatchLGQL, QueryCannotMatch, QuerySyntaxError
 from ..lock import Lock
 from ..httpd import HTTPMethods, HTTPError, httpd, json_encode, json_decode
+from ..uuidgen import uuidgen
+from ..version import VERSION
+from .. import cast
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
@@ -32,10 +35,27 @@ BLOCKSIZE=1048576
 UUID = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
 INT = re.compile(r'^[1-9][0-9]*$')
 STRING = re.compile(r'^.+$')
+ADAPTER = re.compile(r'^[A-Z][A-Z0-9_]*$')
+
+try:
+    FileExistsError # Python 3
+except NameError:
+    class FileExistsError(OSError): # Python 2
+        pass
+
+try:
+    now = time.monotonic
+except AttributeError:
+    now = time.time
 
 def date_to_timestamp(s):
+    try:
+        return uuid_to_utc_ts(s)
+    except ValueError:
+        pass
     dt = dateutil.parser.parse(s)
-    return time.mktime(dt.utctimetuple()) + dt.microsecond // 1e6
+    # time.mktime expects local time
+    return time.mktime(dt.astimezone().timetuple()) + dt.microsecond / 1e6
 
 def js_dumps(obj, pretty=False):
     txt = json_encode(obj)
@@ -44,7 +64,7 @@ def js_dumps(obj, pretty=False):
     return txt
 
 def mp_dumps(obj, pretty=False):
-    return msgpack.packb(obj, raw=True)
+    return msgpack.packb(obj, use_bin_type=False)
 
 Streamer = namedtuple('Streamer', 'mime encode')
 streamJS = Streamer('application/json', js_dumps)
@@ -87,11 +107,21 @@ class Handler(HTTPMethods):
     }
     multi = ()
     single = ()
-    single_parameters = {}
 
-    def __init__(self, collection_path=None, graph_opts=None):
+    def __init__(self, collection_path=None, collection_syncd=None, graph_opts=None, notls=False):
         self.collection_path = collection_path
+        self.collection_syncd = collection_syncd
+        self.notls = notls
         self.graph_opts = {} if graph_opts is None else graph_opts
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        global collection
+        if collection is not None:
+            collection.close()
+            collection = None
 
     @lazy
     def collection(self):
@@ -102,8 +132,7 @@ class Handler(HTTPMethods):
         global collection
         if collection is None:
             log.debug('worker collection init')
-            collection = Collection(self.collection_path, graph_opts=self.graph_opts, nosync=True, nometasync=False)
-            atexit.register(collection.close)
+            collection = Collection(self.collection_path, syncd=self.collection_syncd, graph_opts=self.graph_opts, nosync=True, nometasync=False, notls=self.notls)
         return collection
 
     @lazy
@@ -130,13 +159,19 @@ class Handler(HTTPMethods):
     def body(self):
         return self.req.body
 
-    @property
-    def params(self):
-        return parse_qs(self.req.query, keep_blank_values=1)
-
     # grab latest param only
     def param(self, field, default=None):
         return self.params.get(field,[default])[-1]
+
+    # examine last instance of param
+    # if not present, return None (default)
+    # if '0', 'false', or 'no', return False
+    # else return True
+    def flag(self, field, default=None):
+        try:
+            return self.params[field][-1].lower() not in ('0', 'false', 'no')
+        except KeyError:
+            return default
 
     def input(self):
         try:
@@ -153,7 +188,8 @@ class Handler(HTTPMethods):
             raise
         except Exception:
             info = sys.exc_info()
-            log.error('Unhandled exception: %s', traceback.print_exception(*info))
+            trace = ''.join(traceback.format_exception(*info))
+            log.error('Unhandled exception: %s', trace)
             raise HTTPError(409, 'Bad data - %s decode failed' % self.content_type)
         return data
 
@@ -161,12 +197,15 @@ class Handler(HTTPMethods):
     def init(self, req, res):
         self.req = req
         self.res = res
+        self.params = parse_qs(req.query, keep_blank_values=1)
         if req.headers.contains('Accept', 'application/x-msgpack', icase=True):
             self.streamer = Streamers['application/x-msgpack']
         else:
             self.streamer = Streamers['application/json']
         self.dumps = self.streamer.encode
         self.res.headers.set('Content-Type', self.streamer.mime)
+        if 'Origin' in self.req.headers:
+            self.res.headers.set('Access-Control-Allow-Origin', '*')
 
     def format_edge(self, e):
         d = e.as_dict()
@@ -186,7 +225,7 @@ class Handler(HTTPMethods):
     @property
     def graphs_filter(self):
         filter = self.creds
-        filter['enabled'] = True if 'enabled' in self.params else None
+        filter['enabled'] = self.flag('enabled')
         filter['filters'] = self.params.get('filter', None)
         for created in ('created_after', 'created_before'):
             s = self.param(created, None)
@@ -204,14 +243,19 @@ class Handler(HTTPMethods):
             return g
 
         kwargs.update(self.creds)
-        try:
-            return self.collection.graph(uuid, **kwargs)
-        except (IOError, OSError) as e:
-            if e.errno is errno.EPERM:
-                raise HTTPError(403, str(e))
-            elif e.errno is errno.ENOSPC:
-                raise HTTPError(507, str(e))
-            raise HTTPError(404, "Backend graph for %s is inaccessible: %s" % (uuid, str(e)))
+        while True:
+            try:
+                return self.collection.graph(uuid, **kwargs)
+            except (IOError, OSError, FileExistsError) as e:
+                if e.errno == errno.EEXIST and uuid is None:
+                    continue
+                elif e.errno is errno.ENOENT:
+                    raise HTTPError(404, "Graph %s does not exist" % uuid)
+                elif e.errno is errno.ENOSPC:
+                    raise HTTPError(507, str(e))
+                info = sys.exc_info()
+                trace = ''.join(traceback.format_exception(*info))
+                raise HTTPError(500, "Backend graph for %s is inaccessible: %s" % (uuid, trace))
 
     def tmp_graph(self, uuid):
         fd, path = tempfile.mkstemp(dir=self.collection.dir, suffix=".db", prefix="tmp_%s_" % uuid)
@@ -222,6 +266,7 @@ class Handler(HTTPMethods):
     msgpack = Serializer.msgpack()
     def kv(self, txn):
         return txn.kv('lg.restobjs', serialize_value=self.msgpack)
+
 
 def graphtxn(write=False, create=False, excl=False, on_success=None, on_failure=None):
     def decorator(func):
@@ -246,6 +291,7 @@ def graphtxn(write=False, create=False, excl=False, on_success=None, on_failure=
                             txn.flush()
                             self.res.headers.set('X-lg-updates', txn.lastID - lastID)
                         self.res.headers.set('X-lg-maxID', txn.lastID)
+                        self.res.headers.set('X-lg-id', uuid)
                         yield first
                         for x in ret:
                             yield x
@@ -261,7 +307,8 @@ def graphtxn(write=False, create=False, excl=False, on_success=None, on_failure=
                 raise HTTPError(507 if e.errno is errno.ENOSPC else 500, str(e))
             except Exception as e:
                 info = sys.exc_info()
-                log.error('Unhandled exception: %s', traceback.print_exception(*info))
+                trace = ''.join(traceback.format_exception(*info))
+                log.error('Unhandled exception: %s', trace)
                 raise e
             finally:
                 if success is True:
@@ -282,6 +329,7 @@ class _Input(Handler):
         if data is None:
             return
 
+        create = bool(data.get('create', create))
         seed = data.get('seed', False)
         if seed:
             SeedTracker(txn).add(data)
@@ -289,6 +337,8 @@ class _Input(Handler):
             self.do_meta(txn, data['meta'], seed, create)
         elif create:
             self.do_meta(txn, {}, seed, create)
+        if 'adapters' in data:
+            txn.lg_lite.update_adapters(data['adapters'])
         if 'chains' in data:
             self.do_chains(txn, data['chains'], seed, create)
         if 'nodes' in data:
@@ -297,15 +347,8 @@ class _Input(Handler):
             self.do_edges(txn, data['edges'], seed, create)
 
     def do_meta(self, txn, meta, seed=False, create=False):
-        a = txn.nextID
-
         for key, val in iteritems(meta):
             txn.set(key, val, merge=True)
-
-        b = txn.nextID
-        if b > a:
-            # fixme - when updating graph meta, advance any adaptor bookmarks currently at end
-            pass
 
     def do_chains(self, txn, chains, seed, create=False):
         # cleanse & merge
@@ -376,18 +419,6 @@ class _Input(Handler):
             e = txn.edge(**param)
         except:
             raise HTTPError(409, "Bad edge: %s" % edge)
-
-        # handle edge costs, allowed range: [0.0, 1.0]
-        # silently drop bad values:
-        #  cost defaults to 1 when edge is created
-        #  once cost is assigned, value may not be increased, as
-        #   depth recalculation could (would?) cover the entire graph
-        try:
-            cost = props['cost']
-            if cost < 0 or cost > 1 or cost >= e['cost']:
-                del props['cost']
-        except KeyError:
-            pass
 
         e.update(props, merge=True)
         return e
@@ -476,8 +507,13 @@ class Graph_Root(_Input, _Streamy):
                 pass
 
     def post(self, _):
-        uuid = str(uuidgen())
-        return self._create(None, uuid)
+        while True:
+            uuid = uuidgen()
+            try:
+                return self._create(None, uuid)
+            except (OSError, FileExistsError) as e:
+                if e.errno != errno.EEXIST:
+                    raise
 
 class Graph_UUID(_Input, _Streamy):
     path = ('graph', UUID,)
@@ -507,10 +543,7 @@ class Graph_UUID(_Input, _Streamy):
             try:
                 fh = os.fdopen(fd, 'wb')
                 cleanup.appendleft(fh.close)
-                while True:
-                    data = self.body.read(BLOCKSIZE)
-                    if len(data) == 0:
-                        break
+                for data in self.body:
                     fh.write(data)
                 cleanup.popleft()() # fh.close()
 #                with self.collection.graph(dbname, readonly=True, hook=False, create=False) as g:
@@ -520,7 +553,6 @@ class Graph_UUID(_Input, _Streamy):
                 cleanup.pop() # remove os.unlink(path)
                 cleanup.append(lambda: os.unlink('%s-lock' % target))
             except Exception as e:
-                os.unlink(name)
                 raise HTTPError(409, "Upload for %s failed: %s" % (uuid, repr(e)))
             finally:
                 for x in cleanup:
@@ -559,6 +591,10 @@ class Graph_UUID(_Input, _Streamy):
         return s
 
     @property
+    def snap(self):
+        return self.flag('snap', True)
+
+    @property
     def limit(self):
         return int(self.param('limit', 0))
 
@@ -586,7 +622,7 @@ class Graph_UUID(_Input, _Streamy):
 
         uniq = sorted(set(queries))
 
-        if self.param('crawl', '0') != '0':
+        if self.flag('crawl'):
             if self.streamer is not streamJS:
                 raise HTTPError(406, 'Format for graph dump has not been determined for non-json output')
             try:
@@ -597,7 +633,7 @@ class Graph_UUID(_Input, _Streamy):
 
         qtoc = dict((q, i) for i, q in enumerate(uniq))
         try:
-            gen = txn.mquery(uniq, limit=self.limit, start=self.start, stop=self.stop)
+            gen = txn.mquery(uniq, limit=self.limit, start=self.start, stop=self.stop, snap=self.snap)
         except QuerySyntaxError as e:
             raise HTTPError(400, repr(e))
         # fixme - should we try to make edges use the format_edge foo here?
@@ -639,7 +675,7 @@ class Graph_UUID(_Input, _Streamy):
         self.do_input(txn, uuid)
 
     def post(self, _, uuid):
-        if 'create' in self.params:
+        if self.flag('create'):
             # attempt create
             try:
                 for x in self._create(None, uuid):
@@ -653,7 +689,14 @@ class Graph_UUID(_Input, _Streamy):
         for x in self._update(None, uuid):
             yield x
 
-class Graph_UUID_Status(Handler):
+class _Status(Handler):
+    def status(self, uuid):
+        status = self.collection.status(uuid, **self.creds)
+        if status is None:
+            raise HTTPError(404, '%s status is not cached or user/role mismatch' % uuid)
+        return status
+
+class Graph_UUID_Status(_Status):
     path = ('graph', UUID, 'status')
 
     def get(self, _, uuid, __):
@@ -662,12 +705,6 @@ class Graph_UUID_Status(Handler):
     def head(self, _, uuid, __):
         self.status(uuid)
         self.res.code = 200
-
-    def status(self, uuid):
-        status = self.collection.status(uuid)
-        if status is None:
-            raise HTTPError(404, '%s status is not cached' % uuid)
-        return status
 
 class Reset_UUID(_Input, Handler):
     path = ('reset', UUID,)
@@ -692,7 +729,7 @@ class Reset_UUID(_Input, Handler):
                         if keep is None:
                             keep = self.default_keep
 
-                        if keep.get('kv',False):
+                        if keep.get('kv', False):
                             self.clone_kv(t1, t2)
 
                         seeds = keep.get('seeds', None)
@@ -750,43 +787,61 @@ class D3_UUID(_Streamy, Handler):
     def get(self, g, txn, _, uuid):
         self.map = {}
         stop = int(self.param('stop', 0))
+        pos = int(self.param('pos', 0))
         if stop:
             txn.beforeID = stop + 1
-        return self._dump_json(txn)
+        if txn.nextID == pos:
+            raise HTTPError(304, 'Not Modified')
+        mark = self._get_ids(txn, 'mark')
+        filter = self._get_ids(txn, 'filter')
+        return self._dump_json(txn, filter, mark)
 
-    def _dump_json(self, txn):
-        yield '{ "nodes":['
+    def _get_ids(self, txn, param):
+        s = set()
+        qs = self.params.get(param)
+        if qs:
+            for query, chain in txn.mquery(qs):
+                for x in chain:
+                    s.add(x.ID)
+        return s
+
+    def mdumps(self, mark, x, **data):
+        if x.ID in mark:
+            data['mark'] = True
+        data['data'] = x.as_dict()
+        return self.dumps(data)
+
+    def _dump_json(self, txn, filter, mark):
+        yield '{"pos":' + str(txn.nextID) + ',"nodes":['
         nmap = {}
         nidx = 0
-        nodes = txn.nodes()
-        try:
-            n = next(nodes)
+        first = True
+        for n in txn.nodes():
+            if n.ID in filter:
+                continue
+            if first:
+                first = False
+            else:
+                yield ','
             nmap[n.ID] = nidx
             nidx += 1
-            yield self.dumps({ 'data': n.as_dict() })
-            for n in nodes:
-                yield ','
-                nmap[n.ID] = nidx
-                nidx += 1
-                yield self.dumps({ 'data': n.as_dict() })
-        except StopIteration:
-            pass
+            yield self.mdumps(mark, n)
         yield '],"edges":['
-        edges = txn.edges()
-        try:
-            e = next(edges)
-            yield self.dumps({
-                'data': e.as_dict(),
-                'source': nmap[e.srcID],
-                'target': nmap[e.tgtID] })
-            for e in edges:
+        first = True
+        linknums = {}
+        for e in txn.edges():
+            if filter.intersection((e.ID, e.srcID, e.tgtID)):
+                continue
+            if first:
+                first = False
+            else:
                 yield ','
-                yield self.dumps({
-                    'data': e.as_dict(),
-                    'source': nmap[e.srcID],
-                    'target': nmap[e.tgtID] })
-        except StopIteration:
-            pass
+            key = e.srcID, e.tgtID
+            try:
+                linknums[key] = ln = linknums[key] + 1
+            except KeyError:
+                linknums[key] = ln = 1
+            yield self.mdumps(mark, e, source=nmap[e.srcID], target=nmap[e.tgtID], linknum=ln)
         yield ']}\n'
 
 def exec_wrapper(code, **gvars):
@@ -872,6 +927,7 @@ class Graph_UUID_Meta(_Input):
 
 class Graph_UUID_Seeds(Handler, _Streamy):
     path = ('graph', UUID, 'seeds')
+
     @graphtxn(write=False)
     def get(self, g, txn, _, uuid, __):
         return self.stream(SeedTracker(txn).seeds)
@@ -989,7 +1045,7 @@ class KV_UUID_Key(Handler):
             raise HTTPError(404, 'key not found')
 
 class Static(Handler):
-    res = re.compile('^[^/]+\.(js|css|html)')
+    res = re.compile(r'^[^/]+\.(js|css|html)')
     mime = {
         '.html': 'text/html',
         '.css': 'text/css',
@@ -1003,8 +1059,9 @@ class Static(Handler):
         try:
             body = self.cache[resource]
         except KeyError:
-            body = pkg_resources.resource_string(__name__, 'data/%s' % resource)
-            #self.cache[resource] = body
+            body = pkg_resources.resource_string(__name__, '../data/%s' % resource)
+            if static_cache:
+                self.cache[resource] = body
 
         extension = os.path.splitext(resource)[1]
         try:
@@ -1014,11 +1071,13 @@ class Static(Handler):
         self.res.headers.set('Content-Length', len(body))
         return body
 
-class View_UUID(Static):
+class View_UUID(Static, _Status):
     path = ('view', UUID)
 
     def get(self, _, uuid):
-        return super(View_UUID, self).get(Static.path[0], self.param('style', 'd3v4') + '.html')
+        # check creds against index
+        self.status(uuid)
+        return super(View_UUID, self).get(Static.path[0], self.param('style', 'd3v4a') + '.html')
 
 class Favicon(Static):
     path = ('favicon.ico',)
@@ -1026,8 +1085,578 @@ class Favicon(Static):
     def get(self, _):
         return super(Favicon, self).get(Static.path[0], 'lemon.png')
 
+
+def identity(x):
+    return x
+
+class _Params(object):
+    def _normalize(self, target):
+        if isinstance(target, (tuple, list)):
+            for x in target:
+                yield (x, identity)
+        elif isinstance(target, dict):
+            for x, y in iteritems(target):
+                yield (x, identity if y is None else y)
+        else:
+            yield (target, identity)
+
+    def merge_params(self, input={}, single=(), multi=()):
+        output = {}
+        # normalize rules to field => validator pairs
+        fv = dict(self._normalize(single))
+        mfv = dict(self._normalize(multi))
+        # blend single/multi, no collisions allowed
+        for k in mfv:
+            if k in fv:
+                raise RuntimeError(k)
+            fv[k] = mfv[k]
+        # grab all input fields
+        fields = set(self.params)
+        fields.update(input)
+        for field in fields:
+            t = output, field
+            try:
+                # look up validator
+                validate = fv[field]
+                multi = field in mfv
+            except KeyError:
+                # look up validator by prefix
+                try:
+                    pfx, label = field.rsplit('.', 1)
+                except ValueError:
+                    raise KeyError(field)
+                pfx += '.'
+                validate = fv[pfx]
+                if pfx not in output:
+                    output[pfx] = {}
+                t = output[pfx], label
+                multi = pfx in mfv
+
+            if field in input:
+                # try POST'd input first
+                val = input[field]
+                # silently promote scalars to lists, if expecting a multi
+                if multi and not isinstance(val, (tuple, list)):
+                    val = [val]
+            elif multi:
+                # fall back to query params (always an array)
+                val = self.params[field]
+            else:
+                try:
+                    val, = self.params[field]
+                except ValueError:
+                    raise HTTPError(400, 'parameter may only be specified once: %s' % repr(field))
+            # stash output
+            t[0][t[1]] = [validate(v) for v in val] if multi else validate(val)
+        return output
+
+class LG(Handler):
+    path = ('lg',)
+    offset = 2
+
+    def get(self):
+        stats = {}
+        with self.collection.context(write=False) as ctx:
+            try:
+                flows = ctx.lg_lite_index.adapters
+                for adapter_query, count in iteritems(flows):
+                    adapter, query = adapter_query.split(':', 1)
+                    try:
+                        stats[adapter][query] = count
+                    except KeyError:
+                        stats[adapter] = { query: count }
+            except KeyError:
+                pass
+        return self.dumps(stats, pretty=True)
+
+class LG_Config_Job(Handler):
+    path = ('lg', 'config', UUID)
+    offset = 2
+
+    def get(self, job_uuid, adapter=None):
+        ret = {}
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                try:
+                    for flow in txn.lg_lite.flows(adapter=adapter):
+                        data = {
+                            'pos': flow.pos,
+                            'qlen': flow.qlen,
+                            'limit': flow.limit,
+                            'tasks': flow.active_count,
+                            'active': flow.active,
+                            'enabled': flow.enabled,
+                            'timeout': flow.timeout,
+                            'autotask': flow.autotask,
+                        }
+                        try:
+                            ret[flow.adapter][flow.query] = data
+                        except KeyError:
+                            ret[flow.adapter] = { flow.query: data }
+                except KeyError:
+                    raise HTTPError(404, 'adapter not found: %s' % repr(adapter))
+        return self.dumps(ret, pretty=True)
+
+    def post(self, job_uuid):
+        config = self.input() or {}
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                txn.lg_lite.update_adapters(config)
+
+class LG_Config_Job_Adapter(LG_Config_Job):
+    path = ('lg', 'config', UUID, ADAPTER)
+
+    def post(self, job_uuid, adapter):
+        config = self.input() or {}
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                txn.lg_lite.update_adapter(adapter, config)
+
+class _LG_Tasky(Handler, _Streamy):
+    @staticmethod
+    def task_info(task, ids=None, data=None):
+        chains = task.chains() if data else ()
+        if ids:
+            # ensure at least one record has a requested node/edge ID
+            cs = task.chains(ids=set(ids))
+            for chain in cs:
+                break
+            else:
+                return
+            if data is None:
+                # add matching records to output if 'data' flag was unspecified
+                chains = itertools.chain([chain], cs)
+        # emit task status object
+        return task.status, chains
+
+    def stream_job_task(self, job_uuid, priority=None, meta=None, touch=False, **kwargs):
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                try:
+                    task = txn.lg_lite.task(**kwargs)
+                except IndexError:
+                    # kicks us out of the txn 'with' block
+                    txn.commit()
+
+                task.update(touch=touch)
+                location = '/lg/task/%s/%s' % (job_uuid, task.uuid)
+                self.res.headers.set('Location', location)
+                status = task.status
+                status['location'] = location
+                status['uuid'] = job_uuid
+                if meta:
+                    status['meta'] = m = {}
+                    for k in meta:
+                        try:
+                            m[k] = txn[k]
+                        except KeyError:
+                            pass
+                if priority is not None:
+                    self.res.headers.set('X-lg-priority', str(priority))
+                for chunk in self.stream([status], task.format()):
+                    yield chunk
+                return
+        raise IndexError
+
+class LG__Adapter(_Params, _LG_Tasky):
+    path = ('lg', 'adapter', ADAPTER)
+    offset = 2
+
+    def get_task(self, adapter, query, uuid=(), **kwargs):
+        if uuid:
+            uuid = (x for x in uuid if isinstance(x, str) and UUID.match(x))
+            for job_uuid in uuid:
+                try:
+                    for x in self.stream_job_task(job_uuid, adapter=adapter, query=query, **kwargs):
+                        yield x
+                    return
+                except (IndexError, HTTPError):
+                    pass
+            return
+
+        with self.collection.context(write=False) as ctx:
+            try:
+                jobs = ctx.lg_lite_index.jobs(adapter, query)
+            except KeyError:
+                raise IndexError
+            cursor = jobs.cursor()
+            job_uuid, pri = cursor.next(ctx.txn)
+        while True:
+            try:
+                for x in self.stream_job_task(job_uuid, adapter=adapter, query=query, priority=pri, **kwargs):
+                    yield x
+                with self.collection.context(write=True) as ctx:
+                    try:
+                        # re-add job w/ it's current priority, which
+                        # could have changed, if it is still queued
+                        jobs = ctx.lg_lite_index.jobs(adapter, query)
+                        jobs.add(job_uuid, priority=jobs[job_uuid])
+                    except KeyError:
+                        pass
+                return
+            except (IndexError, HTTPError):
+                pass
+            with self.collection.context(write=False) as ctx:
+                job_uuid, pri = cursor.next(ctx.txn)
+
+    def next_query(self, adapter):
+        with self.collection.context(write=True) as ctx:
+            try:
+                return ctx.lg_lite_index.queries(adapter).next()
+            except (KeyError, IndexError):
+                pass
+        raise IndexError
+
+    def queries(self, adapter):
+        seen = set()
+        try:
+            query = self.next_query(adapter)
+            while query not in seen:
+                seen.add(query)
+                yield query
+                query = self.next_query(adapter)
+        except IndexError:
+            pass
+
+    def _get_post(self, adapter):
+        data = self.input() or {}
+        params = self.merge_params(input=data,
+            single={'limit': cast.uint, 'timeout': cast.unum },
+            multi=('query', 'ignore', 'meta', 'uuid'))
+
+        queries = set(params.pop('query', [])) or self.queries(adapter)
+        try:
+            for query in queries:
+                try:
+                    for x in self.get_task(adapter, query, touch=True, **params):
+                        yield x
+                    return
+                except IndexError:
+                    pass
+        finally:
+            if not isinstance(queries, set):
+                queries.close()
+
+    get  = _get_post
+    post = _get_post
+
+class LG__Adapter_Job(_Params, Handler):
+    path = ('lg', 'adapter', ADAPTER, UUID)
+    offset = 2
+
+    def post(self, adapter, job_uuid):
+        data = self.input() or {}
+        params = self.merge_params(input=data, single=('query', 'filter'))
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                count = txn.lg_lite.inject(adapter, **params)
+        return self.dumps({'chains': count}, pretty=True)
+
+class LG__Task_Job_Task(Handler):
+    path = ('lg', 'task', UUID, UUID)
+    offset = 2
+
+    def head(self, job_uuid, task_uuid):
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                try:
+                    txn.lg_lite.task(uuid=task_uuid).touch()
+                except KeyError:
+                    raise HTTPError(404, 'task not found: %s' % task_uuid)
+
+    def delete(self, job_uuid, task_uuid):
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                try:
+                    txn.lg_lite.task(uuid=task_uuid).drop()
+                except KeyError:
+                    raise HTTPError(404, 'task not found: %s' % task_uuid)
+
+class LG__Task_Job(_LG_Tasky, _Params):
+    path = ('lg', 'task', UUID)
+    offset = 2
+    _xlate = dict(task="uuids", state="states", adapter="adapters")
+
+    def _streamtasks(self, txn, filter, update, ids, data):
+        for task in txn.lg_lite.tasks(**filter):
+            try:
+                status, chains = self.task_info(task, ids=ids, data=data)
+            except TypeError:
+                continue
+            if update:
+                task.update(**update)
+            yield status
+            for chain in task.format(chains):
+                yield chain
+
+    def _get_post(self, job_uuid):
+        data = self.input() or {}
+        params = self.merge_params(input=data,
+            single={'update': dict, 'data': cast.boolean},
+            multi={'state': str, 'adapter': str, 'task': str, 'id': cast.uint})
+        ids = params.pop('id', None)
+        data = params.pop('data', None)
+        update = params.pop('update', None)
+        filter = { self._xlate[k]:v for k,v in iteritems(params) }
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=bool(update)) as txn:
+                for chunk in self.stream(self._streamtasks(txn, filter, update, ids, data)):
+                    yield chunk
+
+    get  = _get_post
+    post = _get_post
+
+class LG__Task_Job_Task_post(_Input):
+    path = ('lg', 'task', UUID, UUID)
+    offset = 2
+
+    def post(self, job_uuid, task_uuid):
+        params = self.input()
+        if params is None:
+            raise HTTPError(400, "Payload required")
+
+        # default task update params
+        update = dict(touch=True)
+
+        # harvest task update parameters
+        for k in 'touch', 'details', 'timeout':
+            try:
+                update[k] = params.pop(k)
+            except KeyError:
+                pass
+
+        # but 'state' is special
+        state = params.pop('state', 'done')
+        if isinstance(state, string_types):
+            # current task state must be 'active' or 'idle'
+            # set to provided state after ingest
+            state = { 'active': state, 'idle': state }
+        elif isinstance(state, list):
+            # current task state can be any of the provided
+            # map each to itself - do not update state
+            state = dict(zip(state, state))
+        elif not isinstance(state, dict):
+            raise HTTPError(400, "bad value for 'state': %s" % repr(state))
+        # else state is dict: { 'from_state': 'to_state' }
+
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=True) as txn:
+                try:
+                    task = txn.lg_lite.task(uuid=task_uuid)
+                except (KeyError, IndexError):
+                    raise HTTPError(404, 'task not found: %s' % task_uuid)
+                try:
+                    # map current task state to target state
+                    state = state[task.state]
+                except KeyError:
+                    raise HTTPError(400, 'current task state %s not in allowed: %s' % (repr(task.state), ', '.join(state.keys())))
+                try:
+                    # ensure target state is valid
+                    update['state'] = task.states[state]
+                except KeyError:
+                    raise HTTPError(400, 'bad target task state:' % state)
+                # process remaining task results
+                self.do_input(txn, job_uuid, data=params)
+                # finally update task state
+                task.update(**update)
+
+class LG__Task_Job_Task_get(_Params, _LG_Tasky):
+    path = ('lg', 'task', UUID, UUID)
+    offset = 2
+
+    def get(self, job_uuid, task_uuid):
+        params = self.merge_params(multi=('meta',))
+        try:
+            return self.stream_job_task(job_uuid, uuid=task_uuid, **params)
+        except KeyError:
+            raise HTTPError(404, 'task not found: %s' % task_uuid)
+
+class LG__Delta_Job(Handler, _Params, _Streamy):
+    path = ('lg', 'delta', UUID)
+    offset = 2
+
+    def _tags(self, txn, qbits, seen=(), **kwargs):
+        tags = {}
+        for q, chain in txn.mquery(qbits.keys(), **kwargs):
+            for e in chain:
+                if e.ID in seen:
+                    continue
+                try:
+                    tags[e.ID] |= qbits[q]
+                except KeyError:
+                    tags[e.ID] = qbits[q]
+        return tags
+
+    def _delta(self, uuid, txn, params):
+        header = {
+            'id': uuid,
+            'pos': txn.nextID,
+            'size': txn.graph.size,
+            'nodes': txn.nodes_count(),
+            'edges': txn.edges_count(),
+            'enabled': txn.enabled,
+            'priority': txn.priority,
+            'created': uuid_to_utc(uuid),
+        }
+
+        pos = params.get('pos', None) or 1
+        if pos >= txn.nextID:
+            yield header
+            return
+
+        # fixme - could add Deletion here
+        reserved = 'Node', 'Edge'
+        typebits = { Transaction: 0 }
+        typebits.update((eval(x), 1<<i) for i, x in enumerate(reserved))
+        tag_list = header['tags'] = list(reserved)
+
+        if 'tag.' in params:
+            qbits = {}
+            for tag, qs in sorted(params['tag.'].items()):
+                if tag in reserved:
+                    raise HTTPError(400, 'tag %s is reserved' % repr(tag))
+                # map query strings to bit combos
+                b = 1 << len(tag_list)
+                tag_list.append(tag)
+                for q in qs:
+                    try:
+                        qbits[q] |= b
+                    except KeyError:
+                        qbits[q] = b
+            cur_tags = self._tags(txn, qbits)
+        else:
+            cur_tags = {}
+        yield header
+
+        # step through graph log
+        seen = set()
+        for e in txn.scan(start=pos):
+            while e.is_property:
+                if not e.parentID:
+                    e = txn
+                    break
+                e = e.parent
+            if e.ID in seen:
+                continue
+            seen.add(e.ID)
+            if not e.ID:
+                # emit updated graph meta
+                yield [0, e.as_dict()]
+                continue
+            # grab lastest version of node/edge (fixme - deletions)
+            e = e.clone(beforeID=0)
+            flags = typebits[type(e)] | cur_tags.pop(e.ID, 0)
+            # emit bitfield and properties for updated/new nodes/edges
+            yield [flags, e.as_dict()]
+
+        # done if there was no provided log position and tags
+        if pos == 1:
+            return
+        try:
+            qbits
+        except NameError:
+            return
+
+        # pull tags as of previous position, filtering out IDs already emitted
+        old_tags = self._tags(txn, qbits, seen=seen, stop=pos-1)
+
+        # collect the delta
+        delta_tags = {}
+
+        # remove cur_tags from old_tags, add new/differing tag bits to delta_tags
+        for ID, cbits in iteritems(cur_tags):
+            if cbits != old_tags.pop(ID, 0):
+                delta_tags[ID] = cbits;
+
+        # everything left in old_tags should be zeroed out
+        for ID in old_tags:
+            delta_tags[ID] = 0
+
+        # emit bitfield and properties for graph-meta/nodes/edges that have different tags
+        for ID, bits in iteritems(delta_tags):
+            e = txn.entry(ID)
+            flags = typebits[type(e)] | bits
+            yield [flags, e.as_dict()]
+
+    def _get_post(self, job_uuid):
+        data = self.input() or {}
+        params = self.merge_params(input=data,
+            single={'pos': cast.uint, 'style': str},
+            multi={'tag.': str, 'filter': str, 'mark': str})
+        # if present, merge old-style filter/mark params into tags structure
+        tags = None
+        for tag in ('filter', 'mark'):
+            try:
+                qs = params.pop(tag)
+            except KeyError:
+                continue
+            for q in qs:
+                if tags is None:
+                    try:
+                        tags = params['tag.']
+                    except KeyError:
+                        tags = params['tag.'] = {}
+                try:
+                    tags[tag].append(q)
+                except KeyError:
+                    tags[tag] = [q]
+        # emit graph deltas
+        with self.graph(job_uuid, create=False) as g:
+            with g.transaction(write=False) as txn:
+                for chunk in self.stream(self._delta(job_uuid, txn, params)):
+                    yield chunk
+
+    get  = _get_post
+    post = _get_post
+
+class MchLGQL(MatchLGQL):
+    suppress_node_fields = Node_Reserved
+    suppress_edge_fields = Edge_Reserved
+
+class LG__Test(_Params, Handler):
+    path = ('lg', 'test')
+    offset = 2
+
+    def _get_post(self):
+        data = self.input() or {}
+        params = self.merge_params(input=data, multi=('query',))
+        output = {}
+        queries = params.pop('query', [])
+        if queries:
+            qs = output['queries'] = {}
+            for q in queries:
+                if q in qs:
+                    continue
+                qinfo = qs[q] = {}
+                try:
+                    m = MchLGQL(q)
+                    qinfo['valid'] = True
+                except (QueryCannotMatch, QuerySyntaxError) as e:
+                    qinfo['error'] = str(e)
+                    continue
+                qinfo['reduced'] = m.reduce
+        return self.dumps(output, pretty=True)
+
+    get  = _get_post
+    post = _get_post
+
+class LG__Status(Handler):
+    path = 'lg', 'status'
+    offset = 2
+
+    boot = now()
+
+    def get(self):
+        uptime = now() - self.boot
+        uptime = int(1000 * uptime) / 1000.0
+        status = {
+            'version': VERSION,
+            'uptime': uptime,
+        }
+        return self.dumps(status, pretty=True)
+
 class Server(object):
-    def __init__(self, collection_path=None, graph_opts=None, **kwargs):
+    def __init__(self, collection_path=None, collection_syncd=None, graph_opts=None, notls=False, cache=True, **kwargs):
         classes = (
             Graph_Root,
             Graph_UUID,
@@ -1045,6 +1674,18 @@ class Server(object):
             D3_UUID,
             Favicon,
             Static,
+            LG,
+            LG_Config_Job,
+            LG_Config_Job_Adapter,
+            LG__Adapter,
+            LG__Adapter_Job,
+            LG__Task_Job,
+            LG__Task_Job_Task,
+            LG__Task_Job_Task_post,
+            LG__Task_Job_Task_get,
+            LG__Delta_Job,
+            LG__Test,
+            LG__Status,
         )
 
         global lock
@@ -1053,6 +1694,9 @@ class Server(object):
         global collection
         collection = None
 
-        handlers = tuple( H(collection_path=collection_path, graph_opts=graph_opts) for H in classes)
+        global static_cache
+        static_cache = bool(cache)
+
+        handlers = tuple( H(collection_path=collection_path, collection_syncd=collection_syncd, graph_opts=graph_opts, notls=notls) for H in classes)
         kwargs['handlers'] = handlers
         httpd(**kwargs)

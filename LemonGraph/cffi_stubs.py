@@ -112,6 +112,7 @@ int graph_updated(graph_t g);
 size_t graph_size(graph_t g);
 void graph_remap(graph_t g);
 void graph_close(graph_t g);
+int graph_fd(graph_t g);
 
 // fetch entities by logID
 entry_t graph_entry(graph_txn_t txn, const logID_t id);
@@ -125,6 +126,9 @@ logID_t graph_entry_updateID(graph_txn_t txn, entry_t e, logID_t beforeID);
 logID_t graph_node_updateID(graph_txn_t txn, node_t n, logID_t beforeID);
 logID_t graph_edge_updateID(graph_txn_t txn, edge_t e, logID_t beforeID);
 logID_t graph_prop_updateID(graph_txn_t txn, prop_t p, logID_t beforeID);
+
+// returns beforeID for entire transaction that given id was written in
+logID_t graph_snap_id(graph_txn_t txn, logID_t id);
 
 // get properties
 prop_t graph_get(graph_txn_t txn, void *key, size_t klen, logID_t beforeID);
@@ -164,6 +168,7 @@ graph_iter_t graph_nodes(graph_txn_t txn, logID_t beforeID);
 graph_iter_t graph_edges(graph_txn_t txn, logID_t beforeID);
 graph_iter_t graph_nodes_type(graph_txn_t txn, void *type, size_t tlen, logID_t beforeID);
 graph_iter_t graph_edges_type(graph_txn_t txn, void *type, size_t tlen, logID_t beforeID);
+graph_iter_t graph_edges_type_value(graph_txn_t txn, void *type, size_t tlen, void *value, size_t vlen, logID_t beforeID);
 graph_iter_t graph_node_edges_in(graph_txn_t txn, node_t node, logID_t beforeID);
 graph_iter_t graph_node_edges_out(graph_txn_t txn, node_t node, logID_t beforeID);
 graph_iter_t graph_node_edges(graph_txn_t txn, node_t node, logID_t beforeID);
@@ -181,6 +186,7 @@ void graph_iter_close(graph_iter_t iter);
 
 char *graph_string(graph_txn_t txn, strID_t id, size_t *len);
 int graph_string_lookup(graph_txn_t txn, strID_t *id, void const *data, const size_t len);
+int graph_string_resolve(graph_txn_t txn, strID_t *id, void const *data, const size_t len);
 logID_t graph_log_nextID(graph_txn_t txn);
 
 // kv storage api - domains get mapped to stringIDs via the string storage layer
@@ -191,15 +197,50 @@ logID_t graph_log_nextID(graph_txn_t txn);
 
 kv_t graph_kv(graph_txn_t txn, const void *domain, const size_t dlen, const int flags);
 void *kv_get(kv_t kv, void *key, size_t klen, size_t *dlen);
+void *kv_first_key(kv_t kv, size_t *klen);
 void *kv_last_key(kv_t kv, size_t *len);
 int kv_del(kv_t kv, void *key, size_t klen);
 int kv_put(kv_t kv, void *key, size_t klen, void *data, size_t dlen);
+int kv_next(kv_t kv, void **key, size_t *klen, void **data, size_t *dlen);
+int kv_next_reset(kv_t kv);
+int kv_clear_pfx(kv_t kv, uint8_t *pfx, unsigned int len);
+int kv_clear(kv_t kv);
 void kv_deref(kv_t kv);
 
 kv_iter_t kv_iter(kv_t kv);
 kv_iter_t kv_iter_pfx(kv_t kv, uint8_t *pfx, unsigned int len);
 int kv_iter_next(kv_iter_t iter, void **key, size_t *klen, void **data, size_t *dlen);
+int kv_iter_seek(kv_iter_t iter, void *key, size_t klen);
 void kv_iter_close(kv_iter_t iter);
+
+// fifos
+int kv_fifo_push_n(kv_t kv, void **datas, size_t *lens, const int count);
+int kv_fifo_push(kv_t kv, void *data, size_t len);
+int kv_fifo_peek_n(kv_t kv, void **datas, size_t *lens, const int count);
+int kv_fifo_peek(kv_t kv, void **data, size_t *size);
+int kv_fifo_delete(kv_t kv, const int count);
+int kv_fifo_len(kv_t kv, uint64_t *len);
+
+// priority queues
+int kv_pq_add(kv_t kv, void *key, size_t klen, uint8_t priority);
+int kv_pq_get(kv_t kv, void *key, size_t klen);
+int kv_pq_del(kv_t kv, void *key, size_t klen);
+kv_iter_t kv_pq_iter(kv_t kv);
+int kv_pq_iter_next(kv_iter_t iter, void **data, size_t *dlen);
+uint8_t *kv_pq_cursor(kv_t kv, uint8_t priority);
+int kv_pq_cursor_next(graph_txn_t txn, uint8_t *cursor, void **key, size_t *klen);
+void kv_pq_cursor_close(uint8_t *cursor);
+
+// helpers for serializing/unserializing tuples of non-negative integers
+int pack_uints(int count, uint64_t *ints, void *buffer);
+int unpack_uints(int count, uint64_t *ints, void *buffer);
+int unpack_uints2(int count, uint64_t *ints, void *buffer, size_t buflen);
+int pack_uint(uint64_t i, char *buffer);
+uint64_t unpack_uint(char *buffer);
+int pack_uuid(char *uuid, char *bin);
+int unpack_uuid(char *bin, char *uuid);
+
+typedef ... DIR;
 
 // snapshot foo
 int db_snapshot_to_fd(db_t db, int fd, int compact);
@@ -208,16 +249,7 @@ ssize_t db_snapshot_read(db_snapshot_t snap, void *buffer, size_t len);
 int db_snapshot_close(db_snapshot_t snap);
 int db_snapshot_fd(db_snapshot_t snap);
 
-// helpers for serializing/unserializing tuples of non-negative integers
-int pack_uints(int count, uint64_t *ints, void *buffer);
-int unpack_uints(int count, uint64_t *ints, void *buffer);
-int pack_uint(uint64_t i, char *buffer);
-uint64_t unpack_uint(char *buffer);
-
-typedef ... DIR;
-
 // custom extras
-void watch_parent(int sig);
 void free(void *);
 DIR *opendir(const char *name);
 char *_readdir(DIR *dirp);
@@ -236,10 +268,31 @@ int graph_set_mapsize(graph_t g, size_t mapsize);
 size_t graph_get_mapsize(graph_t g);
 size_t graph_get_disksize(graph_t g);
 db_snapshot_t graph_snapshot_new(graph_t g, int compact);
+
+int afsync_receiver(char *dir, unsigned int threads, int sfd);
+int afsync_queue(int sfd, char *uuid);
+int afsync_unqueue(int sfd, char *uuid);
+
+int server(int *socks, size_t n, ssize_t workers, char **extras, size_t ecount, int level, int sockd_level);
+
+#define LG_WORKER_KEEPALIVE  ...
+#define LG_WORKER_EXIT ...
+
+typedef struct {
+	int sock, conn, family, type, proto;
+	char byte;
+} lg_worker_t;
+
+lg_worker_t *lg_worker_new(int sock);
+int lg_worker_accept(lg_worker_t *w);
+int lg_worker_finish(lg_worker_t *w, unsigned char flags);
+
+void lg_log_init(int level, char *name);
+void lg_log_msg(int level, char *fmt, ...);
 '''
 
 C_KEYWORDS = dict(
-    sources=['deps/lmdb/libraries/liblmdb/mdb.c', 'deps/lmdb/libraries/liblmdb/midl.c', 'lib/lemongraph.c', 'lib/db.c'],
+    sources=['deps/lmdb/libraries/liblmdb/mdb.c', 'deps/lmdb/libraries/liblmdb/midl.c', 'lib/lemongraph.c', 'lib/db.c', 'lib/counter.c', 'lib/afsync.c', 'lib/avl.c', 'lib/list.c', 'lib/xfd.c', 'lib/server.c', 'lib/logging.c'],
     include_dirs=['lib','deps/lmdb/libraries/liblmdb'],
     libraries=['z'],
 )

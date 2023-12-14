@@ -1,7 +1,3 @@
-#ifndef _BSD_SOURCE
-#define _BSD_SOURCE
-#endif
-
 // suppress assert() elimination, as we are currently heavily relying on it
 #ifdef NDEBUG
 #undef NDEBUG
@@ -25,6 +21,7 @@
 #include<lemongraph.h>
 
 #include"static_assert.h"
+#include"counter.h"
 
 typedef uint64_t txnID_t;
 
@@ -42,31 +39,7 @@ STATIC_ASSERT(sizeof(uint64_t) == sizeof(strID_t), "");
 //#define debug(args...) do{ fprintf(stderr, "%d: ", __LINE__); fprintf(stderr, args); }while(0)
 //#define debug(args...) while(0);
 
-// provide type-agnostic clz wrapper, and return a more useful value for clz(0)
-#define __clz_wrapper(x) (int)((x) ? (sizeof(x) == sizeof(long) ? __builtin_clzl(x) : (sizeof(x) == sizeof(long long) ? __builtin_clzll(x) : __builtin_clz((int)(x)))) : sizeof(x) * 8)
-
-// quickly take unsigned numeric types and count minimum number of bytes needed to represent - for varint encoding
-#define intbytes(x) (sizeof(x) - __clz_wrapper(x) / 8)
-
-// encode unsigned values into buffer, advancing iter
-// ensure you have a least 9 bytes per call
-#define encode(x, buffer, iter) do{ \
-	int _shift; \
-	((uint8_t *)(buffer))[iter] = intbytes(x); \
-	for(_shift = (((uint8_t *)(buffer))[iter++] - 1) * 8; _shift >= 0; iter++, _shift -= 8) \
-		((uint8_t *)(buffer))[iter] = ((x) >> _shift) & 0xff; \
-}while(0)
-
-// corresponding decode
-#define decode(x, buffer, iter) do{ \
-	uint8_t _count = ((uint8_t *)(buffer))[iter++]; \
-	assert(sizeof(x) >= _count); \
-	x = 0; \
-	while(_count--) \
-		x = (x<<8) + ((uint8_t *)(buffer))[iter++]; \
-}while(0)
-
-#define enclen(buffer, offset) (1 + ((uint8_t *)(buffer))[offset])
+#include"uic.h"
 
 #define esizeof(x) (sizeof(x)+1)
 
@@ -77,11 +50,27 @@ int pack_uints(int count, uint64_t *ints, void *buffer){
 	return len;
 }
 
+// unpacks 'count' uints
+// returns number of input bytes consumed
 int unpack_uints(int count, uint64_t *ints, void *buffer){
 	int i, len = 0;
 	for(i = 0; i < count; i++)
 		decode(ints[i], buffer, len);
 	return len;
+}
+
+// unpacks up to 'count' uints
+// returns how many it could have unpacked if buffer was big enough
+// (if return is larger than 'count', then call again w/ a bigger buffer)
+int unpack_uints2(int count, uint64_t *ints, void *buffer, size_t buflen){
+	size_t len;
+	int i;
+	for(i = 0, len = 0; len < buflen; i++)
+		if(i < count)
+			decode(ints[i], buffer, len);
+		else
+			len += enclen(buffer, len);
+	return len == buflen ? i : -1;
 }
 
 int pack_uint(uint64_t i, char *buffer){
@@ -95,6 +84,75 @@ uint64_t unpack_uint(char *buffer){
 	uint64_t i;
 	decode(i, buffer, len);
 	return i;
+}
+
+static int pack_nibble(char ch){
+	if(ch <= '9' && ch >= '0')
+		return ch - '0';
+	if(ch <= 'f' && ch >= 'a')
+		return 10 + ch - 'a';
+	if(ch <= 'F' && ch >= 'A')
+		return 10 + ch - 'A';
+	return -1;
+}
+
+static int pack_hex(char *hex){
+	return (pack_nibble(hex[0])<<4) | pack_nibble(hex[1]);
+}
+
+int pack_uuid(char *uuid, char *bin){
+	static const struct {
+		const uint8_t offset:4;
+		const uint8_t octets:4;
+	} map [] = {
+		{ 4,  4 },
+		{ 2,  2 },
+		{ 0,  2 },
+		{ 8,  2 },
+		{ 10, 6,},
+	};
+	unsigned int i;
+	for(i = 0; i < sizeof(map)/sizeof(*map); i++){
+		int offset = map[i].offset;
+		int octets = map[i].octets;
+		do{
+			int octet = pack_hex(uuid);
+			if(octet < 0)
+				return -1;
+			bin[offset++] = octet;
+			uuid += 2;
+		}while(--octets);
+		// skip the hyphen
+		uuid++;
+	}
+	return 16;
+}
+
+int unpack_uuid(char *bin, char *uuid){
+	char *hex = "0123456789abcdef";
+	static const struct {
+		const uint8_t offset:5;
+		const uint8_t octets:3;
+	} map[] = {
+		{ 14, 2 },
+		{ 9,  2 },
+		{ 0,  4 },
+		{ 19, 2 },
+		{ 24, 6 },
+	};
+	unsigned int i;
+	for(i = 0; i < sizeof(map)/sizeof(*map); i++){
+		int offset = map[i].offset;
+		int octets = map[i].octets;
+		if(offset)
+			uuid[offset-1] = '-';
+		do{
+			uuid[offset++] = hex[(*bin >> 4) & 0xf];
+			uuid[offset++] = hex[*bin & 0xf];
+			bin++;
+		}while(--octets);
+	}
+	return 36;
 }
 
 char *graph_strerror(int err){
@@ -154,7 +212,8 @@ static int magic_txnlog_cmp(const buffer_t *a, const buffer_t *b){
 #define DB_SRCNODE_IDX  8
 #define DB_TGTNODE_IDX  9
 #define DB_KV          10
-#define DB_TXNLOG      11
+#define DB_KVBM        11
+#define DB_TXNLOG      12
 
 static dbi_t DB_INFO[] = {
 	// strID_t strID => bytes (append-only)
@@ -183,6 +242,9 @@ static dbi_t DB_INFO[] = {
 
 	// varint_t domain, key => varint_t val
 	[DB_KV] = { "kv", 0, NULL },
+
+	// varint_t domain, key => varint_t val
+	[DB_KVBM] = { "kvbm", 0, NULL },
 
 	// varint_t [txnID, start, count] => varint_t [node_count, edge_count] (append only)
 	[DB_TXNLOG] = { "txnlog", 0, magic_txnlog_cmp }
@@ -232,7 +294,8 @@ static INLINE uint64_t _nextID(graph_txn_t txn, const int consume, uint64_t * co
 		return 0;
 	}
 
-	int r, i;
+	int r;
+	unsigned int i;
 	uint64_t id = *cache;
 	if(0 == id){
 		struct cursor_t c;
@@ -739,7 +802,7 @@ entry_t graph_entry(graph_txn_t txn, const logID_t id){
 	encode(id, buf, key.size);
 	r = db_get((txn_t)txn, DB_LOG, &key, &data);
 	if(DB_SUCCESS == r){
-		const int rectype = *(uint8_t *)data.data;
+		const uint8_t rectype = *(uint8_t *)data.data;
 		assert(rectype < sizeof(recsizes) / sizeof(*recsizes));
 		int klen = 1;
 		e = malloc(recsizes[rectype]);
@@ -828,6 +891,10 @@ logID_t graph_prop_updateID(graph_txn_t txn, prop_t p, logID_t beforeID){
 
 int graph_string_lookup(graph_txn_t txn, strID_t *id, void const *data, const size_t len){
 	return _string_resolve(txn, id, data, len, 1);
+}
+
+int graph_string_resolve(graph_txn_t txn, strID_t *id, void const *data, const size_t len){
+	return _string_resolve(txn, id, data, len, 0);
 }
 
 logID_t graph_log_nextID(graph_txn_t txn){
@@ -988,6 +1055,14 @@ static INLINE int _kv_setup_key(kv_t kv, void *key, size_t klen, int query){
 	return 1;
 }
 
+// fetch string by encoded ID
+static INLINE char *graph_string_enc(graph_txn_t txn, void *id_enc, size_t *slen){
+	strID_t id;
+	int len = 0;
+	decode(id, id_enc, len);
+	return graph_string(txn, id, slen);
+}
+
 void *kv_get(kv_t kv, void *key, size_t klen, size_t *dlen){
 	void *data = NULL;
 	if(!_kv_setup_key(kv, key, klen, 1))
@@ -995,10 +1070,7 @@ void *kv_get(kv_t kv, void *key, size_t klen, size_t *dlen){
 	if(db_get((txn_t)kv->txn, DB_KV, &kv->key, &kv->data) != DB_SUCCESS)
 		goto done;
 	if(kv->flags & LG_KV_MAP_DATA){
-		strID_t id;
-		int len = 0;
-		decode(id, kv->data.data, len);
-		data = graph_string(kv->txn, id, dlen);
+		data = graph_string_enc(kv->txn, kv->data.data, dlen);
 	}else{
 		data = kv->data.data;
 		*dlen = kv->data.size;
@@ -1035,16 +1107,35 @@ done:
 	return ret;
 }
 
-void *kv_last_key(kv_t kv, size_t *len){
+static INLINE void *_kv_key(kv_t kv, buffer_t *key, size_t  *len, const int unmap){
+	if(unmap)
+		return graph_string_enc(kv->txn, key->data + kv->klen, len);
+	*len = key->size - kv->klen;
+	return key->data + kv->klen;
+}
+
+void *kv_first_key(kv_t kv, size_t *klen){
 	struct cursor_t cursor;
 	int r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
 	assert(DB_SUCCESS == r);
 	buffer_t key;
 	void *ret = NULL;
-	if(cursor_last_key(&cursor, &key, kv->kbuf, kv->klen) == DB_SUCCESS){
-		ret = key.data + kv->klen;
-		*len = key.size - kv->klen;
-	}
+	r = cursor_first_key(&cursor, &key, kv->kbuf, kv->klen);
+	if(DB_SUCCESS == r)
+		ret = _kv_key(kv, &key, klen, kv->flags & LG_KV_MAP_KEYS);
+	cursor_close(&cursor);
+	return ret;
+}
+
+void *kv_last_key(kv_t kv, size_t *klen){
+	struct cursor_t cursor;
+	int r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
+	assert(DB_SUCCESS == r);
+	buffer_t key;
+	void *ret = NULL;
+	r = cursor_last_key(&cursor, &key, kv->kbuf, kv->klen);
+	if(DB_SUCCESS == r)
+		ret = _kv_key(kv, &key, klen, kv->flags & LG_KV_MAP_KEYS);
 	cursor_close(&cursor);
 	return ret;
 }
@@ -1056,6 +1147,452 @@ void kv_deref(kv_t kv){
 		free(kv);
 }
 
+int kv_clear_pfx(kv_t kv, uint8_t *pfx, unsigned int len){
+	struct cursor_t cursor;
+	int r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
+	assert(DB_SUCCESS == r);
+	assert(kv->klen + len <= sizeof(kv->kbuf));
+	memcpy(kv->kbuf + kv->klen, pfx, len);
+	len += kv->klen;
+	buffer_t k;
+	r = cursor_first_key(&cursor, &k, kv->kbuf, len);
+	while(DB_SUCCESS == r){
+		cursor_del(&cursor, 0);
+		r = cursor_first_key(&cursor, &k, kv->kbuf, len);
+	}
+	cursor_close(&cursor);
+	return 1;
+}
+
+int kv_clear(kv_t kv){
+	return kv_clear_pfx(kv, NULL, 0);
+}
+
+int kv_fifo_push_n(kv_t kv, void **datas, size_t *lens, const int count){
+	struct cursor_t cursor;
+	int r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
+	assert(DB_SUCCESS == r);
+	r = cursor_last_key(&cursor, &kv->key, kv->kbuf, kv->klen);
+	if(DB_NOTFOUND == r){
+		r = DB_SUCCESS;
+		kv->key.size = kv->klen + ctr_init(kv->kbuf + kv->klen);
+	}else if(DB_SUCCESS == r){
+		memcpy(kv->kbuf, kv->key.data, kv->key.size);
+		kv->key.size = kv->klen + ctr_inc(kv->kbuf + kv->klen);
+	}
+	kv->key.data = kv->kbuf;
+
+	const int resolve = kv->flags & (LG_KV_MAP_KEYS|LG_KV_MAP_DATA);
+	int i;
+	strID_t id;
+	uint8_t edata[esizeof(id)];
+	for(i = 0; DB_SUCCESS == r && i < count; i++){
+		if(resolve){
+			if(!_string_resolve(kv->txn, &id, datas[i], lens[i], 0)){
+				r = DB_NOTFOUND;
+				goto done;
+			}
+			kv->data.size = 0;
+			kv->data.data = edata;
+			encode(id, edata, kv->data.size);
+		}else{
+			kv->data.data = datas[i];
+			kv->data.size = lens[i];
+		}
+		if(i)
+			kv->key.size = kv->klen + ctr_inc(kv->kbuf + kv->klen);
+		r = cursor_put(&cursor, &kv->key, &kv->data, 0);
+	}
+	if(DB_SUCCESS == r)
+		r = i;
+done:
+	cursor_close(&cursor);
+	return r;
+}
+
+int kv_fifo_push(kv_t kv, void *data, size_t len){
+	return kv_fifo_push_n(kv, &data, &len, 1);
+}
+
+int kv_fifo_peek_n(kv_t kv, void **datas, size_t *lens, const int count){
+	struct cursor_t cursor;
+	int i, r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
+	assert(DB_SUCCESS == r);
+	const int resolve = kv->flags & (LG_KV_MAP_KEYS|LG_KV_MAP_DATA);
+	r = cursor_first_key(&cursor, &kv->key, kv->kbuf, kv->klen);
+	for(i = 0; DB_SUCCESS == r && i < count; i++){
+		r = cursor_get(&cursor, &kv->key, &kv->data, DB_SET_KEY);
+		assert(DB_SUCCESS == r);
+		if(resolve){
+			datas[i] = graph_string_enc(kv->txn, kv->data.data, &lens[i]);
+		}else{
+			datas[i] = kv->data.data;
+			lens[i] = kv->data.size;
+		}
+		r = cursor_get(&cursor, &kv->key, NULL, DB_NEXT);
+		if(DB_SUCCESS != r || kv->key.size < kv->klen || memcmp(kv->key.data, kv->kbuf, kv->klen))
+			r = DB_NOTFOUND;
+	}
+	if(DB_SUCCESS == r || DB_NOTFOUND == r)
+		r = i;
+	cursor_close(&cursor);
+	return r;
+}
+
+int kv_fifo_peek(kv_t kv, void **data, size_t *size){
+	return kv_fifo_peek_n(kv, data, size, 1);
+}
+
+int kv_fifo_delete(kv_t kv, const int count){
+	struct cursor_t cursor;
+	int i, r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
+	assert(DB_SUCCESS == r);
+	r = cursor_first_key(&cursor, &kv->key, kv->kbuf, kv->klen);
+	for(i = 0; DB_SUCCESS == r && i < count; i++){
+		r = cursor_del(&cursor, 0);
+		assert(DB_SUCCESS == r);
+		r = cursor_first_key(&cursor, &kv->key, kv->kbuf, kv->klen);
+	}
+	if(DB_SUCCESS == r || DB_NOTFOUND == r)
+		r = i;
+	cursor_close(&cursor);
+	return r;
+}
+
+int kv_fifo_len(kv_t kv, uint64_t *len){
+	struct cursor_t cursor;
+	int r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
+	assert(DB_SUCCESS == r);
+	buffer_t key2;
+	r = cursor_first_key(&cursor, &kv->key, kv->kbuf, kv->klen);
+	if(DB_SUCCESS == r){
+		int r2 = cursor_last_key(&cursor, &key2, kv->kbuf, kv->klen);
+		assert(DB_SUCCESS == r2);
+		*len = 1 + ctr_delta(key2.data + kv->klen, kv->key.data + kv->klen);
+	}else if(DB_NOTFOUND == r){
+		r = DB_SUCCESS;
+		*len = 0;
+	}
+	cursor_close(&cursor);
+	return r;
+}
+
+// priority queues on top of kv
+// we store two different structures under a domain:
+//   first:  enc(domID), 0, priority, counter => key
+//   second: enc(domID), 1, key => priority, counter
+// priority as well as the 0/1 are literal bytes
+// counter is up-to 256 bytes - can increment/decrement from [0 .. ((1<<2040)-1)]
+
+// fetch priority[0..255] for key, on error return < 0
+int kv_pq_get(kv_t kv, void *key, size_t klen){
+	int r;
+	strID_t id;
+	uint8_t ekey[esizeof(id)];
+
+	// optionally swap out key w/ encoded string ID
+	r = DB_NOTFOUND;
+	if(kv->flags & (LG_KV_MAP_KEYS|LG_KV_MAP_DATA)){
+		if(!_string_resolve(kv->txn, &id, key, klen, 0))
+			goto done;
+		klen = 0;
+		key = ekey;
+		encode(id, ekey, klen);
+	}
+
+	// start with encoded domID
+	kv->key.data = kv->kbuf;
+	kv->key.size = kv->klen;
+	// we are checking secondary index
+	kv->kbuf[kv->key.size++] = 1;
+	// append key
+	assert(kv->key.size + klen <= sizeof(kv->kbuf));
+	memcpy(kv->kbuf + kv->key.size, key, klen);
+	kv->key.size += klen;
+
+	// see if it's already somewhere in the queue
+	r = db_get((txn_t)kv->txn, DB_KV, &kv->key, &kv->data);
+	if(DB_SUCCESS != r)
+		goto done;
+
+	// grab priority byte
+	r = *(uint8_t *)kv->data.data;
+done:
+	return r;
+}
+
+// if get (dom, 1, key) => (old_pri, counter)
+//   del (dom, 0, old_pri, counter)
+// if find_last_counter (dom, 0, new_pri)
+//   ctr_inc(counter)
+// else
+//   ctr_init(counter)
+// put (dom, 0, new_pri, counter) => key
+// put (dom, 1, key) => (new_pri, counter)
+
+// on success return 0, on error return < 0
+int kv_pq_del(kv_t kv, void *key, size_t klen){
+	int r;
+	strID_t id;
+	uint8_t ekey[esizeof(id)];
+
+	// optionally swap out key w/ encoded string ID
+	r = DB_NOTFOUND;
+	if(kv->flags & (LG_KV_MAP_KEYS|LG_KV_MAP_DATA)){
+		if(!_string_resolve(kv->txn, &id, key, klen, 0))
+			goto done;
+		klen = 0;
+		key = ekey;
+		encode(id, ekey, klen);
+	}
+
+	// start with encoded domID
+	kv->key.data = kv->kbuf;
+	kv->key.size = kv->klen;
+	// we are checking secondary index
+	kv->kbuf[kv->key.size++] = 1;
+	// append key
+	assert(kv->key.size + klen <= sizeof(kv->kbuf));
+	memcpy(kv->kbuf + kv->key.size, key, klen);
+	kv->key.size += klen;
+
+	// see if it's already somewhere in the queue
+	r = db_get((txn_t)kv->txn, DB_KV, &kv->key, &kv->data);
+
+
+	// if found, use returned priority, counter to delete from primary index
+	if(DB_SUCCESS == r){
+		// start with encoded domID
+		kv->key.data = kv->kbuf;
+		kv->key.size = kv->klen;
+		// we are checking primary index
+		kv->kbuf[kv->key.size++] = 0;
+
+		// append old_pri, counter
+		assert(kv->key.size + kv->data.size <= sizeof(kv->kbuf));
+		memcpy(kv->kbuf + kv->key.size, kv->data.data, kv->data.size);
+		kv->key.size += kv->data.size;
+
+		// delete from primary index
+		r = db_del((txn_t)kv->txn, DB_KV, &kv->key, NULL);
+		assert(DB_SUCCESS == r);
+
+		// rebuild secondary key
+		kv->kbuf[kv->klen] = 1;
+		memcpy(kv->kbuf + kv->klen + 1, key, klen);
+		kv->key.data = kv->kbuf;
+		kv->key.size = kv->klen + 1 + klen;
+
+		// delete from secondary index
+		r = db_del((txn_t)kv->txn, DB_KV, &kv->key, NULL);
+		assert(DB_SUCCESS == r);
+	}
+done:
+	return r;
+}
+
+// on success return 0, on error return < 0
+int kv_pq_add(kv_t kv, void *key, size_t klen, uint8_t priority){
+	strID_t id;
+	int r, pc_len;
+	struct cursor_t cursor;
+	uint8_t ekey[esizeof(id)];
+	uint8_t pri_counter[257];
+
+	r = txn_cursor_init(&cursor, (txn_t)kv->txn, DB_KV);
+	if(DB_SUCCESS != r)
+		goto done0;
+
+	// optionally swap out key w/ encoded string ID
+	r = DB_NOTFOUND;
+	if(kv->flags & (LG_KV_MAP_KEYS|LG_KV_MAP_DATA)){
+		if(!_string_resolve(kv->txn, &id, key, klen, 0))
+			goto done;
+		klen = 0;
+		key = ekey;
+		encode(id, ekey, klen);
+	}
+
+	// start with encoded domID
+	kv->key.data = kv->kbuf;
+	kv->key.size = kv->klen;
+	// we are checking secondary index
+	kv->kbuf[kv->key.size++] = 1;
+	// append key
+	assert(kv->key.size + klen <= sizeof(kv->kbuf));
+	memcpy(kv->kbuf + kv->key.size, key, klen);
+	kv->key.size += klen;
+
+	// see if it's already somewhere in the queue
+	r = db_get((txn_t)kv->txn, DB_KV, &kv->key, &kv->data);
+
+	// start with encoded domID
+	kv->key.data = kv->kbuf;
+	kv->key.size = kv->klen;
+	// we are checking primary index
+	kv->kbuf[kv->key.size++] = 0;
+
+	// if found, use returned priority, counter to delete from primary index
+	if(DB_SUCCESS == r){
+		// append old_pri, counter
+		assert(kv->key.size + kv->data.size <= sizeof(kv->kbuf));
+		memcpy(kv->kbuf + kv->key.size, kv->data.data, kv->data.size);
+		kv->key.size += kv->data.size;
+		// delete from primary index
+		r = db_del((txn_t)kv->txn, DB_KV, &kv->key, NULL);
+		assert(DB_SUCCESS == r);
+	}
+
+	// now insert new priority byte
+	kv->kbuf[kv->klen + 1] = priority;
+	// and find last key w/ that priority in primary index
+	r = cursor_last_key(&cursor, &kv->key, kv->kbuf, kv->klen+2);
+
+	const int tail = kv->klen + 2;
+	if(DB_SUCCESS == r){
+		memcpy(kv->kbuf + tail, kv->key.data + tail, kv->key.size - tail);
+		// increment counter, grab length of pri & counter bytes
+		pc_len = 1 + ctr_inc(kv->kbuf + tail);
+	}else{
+		pc_len = 1 + ctr_init(kv->kbuf + tail);
+	}
+	kv->key.data = kv->kbuf;
+	kv->key.size = kv->klen + 1 + pc_len;
+	// snag copy
+	memcpy(pri_counter, kv->kbuf + kv->klen + 1, pc_len);
+
+	// add in new record in primary index
+	kv->data.data = key;
+	kv->data.size = klen;
+	r = db_put((txn_t)kv->txn, DB_KV, &kv->key, &kv->data, 0);
+	assert(DB_SUCCESS == r);
+
+	// add reverse record in secondary index
+	kv->kbuf[kv->klen] = 1;
+	memcpy(kv->kbuf + kv->klen + 1, key, klen);
+	kv->key.data = kv->kbuf;
+	kv->key.size = kv->klen + 1 + klen;
+	kv->data.data = pri_counter;
+	kv->data.size = pc_len;
+	r = db_put((txn_t)kv->txn, DB_KV, &kv->key, &kv->data, 0);
+	assert(DB_SUCCESS == r);
+
+done:
+	cursor_close(&cursor);
+done0:
+	return r;
+}
+
+uint8_t *kv_pq_cursor(kv_t kv, uint8_t priority){
+	uint8_t *cursor = malloc(512);
+	int len = kv->klen + 1;
+	if(cursor){
+		// holds [decode flag][pfx][magic][priority][counter]
+		// where:
+		//	pfx is (encoded domain ID, 0)
+		//	priority is 1 byte
+
+		// append decode flags
+		cursor[0] = kv->flags & (LG_KV_MAP_KEYS|LG_KV_MAP_DATA);
+
+		// append encoded domain
+		memcpy(cursor + 1, kv->kbuf, kv->klen);
+
+		// append magic byte to select primary index
+		cursor[len++] = 0;
+
+		// append requested priority
+		cursor[len++] = priority;
+
+		// and initialize counter
+		ctr_init(cursor + len);
+	}
+	return cursor;
+}
+
+// on success, advance cursor, fill in key/klen, and return priority [0-255]
+// on error, return < 0
+int kv_pq_cursor_next(graph_txn_t txn, uint8_t *cursor, void **key, size_t *klen){
+	int r;
+	buffer_t k, v;
+	struct cursor_t c;
+
+	const unsigned int domlen = enclen(cursor, 1);
+
+	// flags + domlen + magic + priority
+	const unsigned int ctroff = domlen + 3;
+
+	// domlen + magic
+	const unsigned int pfxlen = domlen + 1;
+
+	// skip flags byte
+	k.data = cursor + 1;
+
+	// encoded domain + magic + priority + counter
+	k.size = pfxlen + 1 + ctr_len(cursor + ctroff);
+
+	r = txn_cursor_init(&c, (txn_t)txn, DB_KV);
+	assert(DB_SUCCESS == r);
+
+	r = cursor_get(&c, &k, NULL, DB_SET_RANGE);
+	if(DB_SUCCESS != r)
+		goto done;
+
+	if(k.size < pfxlen || memcmp(k.data, cursor + 1, pfxlen)){
+		r = DB_NOTFOUND;
+		goto done;
+	}
+
+	r = cursor_get(&c, &k, &v, DB_GET_CURRENT);
+	if(DB_SUCCESS != r)
+		goto done;
+
+	// copy what we found
+	memcpy(cursor + 1, k.data, k.size);
+
+	// increment its counter
+	ctr_inc(cursor + ctroff);
+
+	// harvest priority
+	r = cursor[ctroff-1];
+
+	// possibly lookup result
+	if(cursor[0]){
+		*key = graph_string_enc(txn, v.data, klen);
+	}else{
+		*key = v.data;
+		*klen = v.size;
+	}
+
+done:
+	cursor_close(&c);
+	return r;
+}
+
+void kv_pq_cursor_close(uint8_t *cursor){
+	free(cursor);
+}
+
+kv_iter_t kv_pq_iter(kv_t kv){
+	uint8_t pfx = 0;
+	return kv_iter_pfx(kv, &pfx, 1);
+}
+
+int kv_pq_iter_next(kv_iter_t iter, void **data, size_t *dlen){
+	const iter_t it = (iter_t)iter;
+	int r = iter_next(it);
+	const int ret = (DB_SUCCESS == r);
+	if(ret){
+		const kv_t kv = iter->kv;
+		if(kv->flags & (LG_KV_MAP_KEYS|LG_KV_MAP_DATA)){
+			*data = graph_string_enc(kv->txn, it->data.data, dlen);
+		}else{
+			*data = it->data.data;
+			*dlen = it->data.size;
+		}
+	}
+	return ret;
+}
 
 kv_iter_t kv_iter_pfx(kv_t kv, uint8_t *pfx, unsigned int len){
 	kv_iter_t iter;
@@ -1063,6 +1600,7 @@ kv_iter_t kv_iter_pfx(kv_t kv, uint8_t *pfx, unsigned int len){
 	if(iter){
 		int r;
 		if(pfx){
+			assert((kv->flags & LG_KV_MAP_KEYS) == 0);
 			uint8_t buf[kv->klen + len];
 			memcpy(buf, kv->kbuf, kv->klen);
 			memcpy(buf + kv->klen, pfx, len);
@@ -1082,33 +1620,126 @@ kv_iter_t kv_iter_pfx(kv_t kv, uint8_t *pfx, unsigned int len){
 	return iter;
 }
 
+int kv_next_reset(kv_t kv){
+	buffer_t bmk = { .size = kv->klen, .data = kv->kbuf };
+	int r = db_del((txn_t)kv->txn, DB_KVBM, &bmk, NULL);
+	return (DB_SUCCESS == r || DB_NOTFOUND == r);
+}
+
+int kv_next(kv_t kv, void **key, size_t *klen, void **data, size_t *dlen){
+	int r, ret = 0;
+	buffer_t bmk = { .size = kv->klen, .data = kv->kbuf };
+	buffer_t pos, val;
+	struct cursor_t c;
+	txn_t txn = (txn_t)kv->txn;
+
+	r = txn_cursor_init(&c, txn, DB_KV);
+	assert(DB_SUCCESS == r);
+
+	// try to fetch the bookmark from where we left off
+	r = db_get(txn, DB_KVBM, &bmk, &pos);
+	if(DB_SUCCESS == r){
+		void *found = pos.data;
+		size_t flen = pos.size;
+		r = cursor_get(&c, &pos, NULL, DB_SET_RANGE);
+
+		// step forward if we found it exactly
+		if(DB_SUCCESS == r && flen == pos.size && memcmp(found, pos.data, flen) == 0)
+			r = cursor_get(&c, &pos, NULL, DB_NEXT);
+
+		// if we've run off the end, set error status
+		if(DB_SUCCESS == r && (pos.size < kv->klen || memcmp(pos.data, bmk.data, kv->klen)))
+			r = DB_NOTFOUND;
+	}
+
+	// was there no bookmark? or did set_range fail? or did we run off the end?
+	if(DB_SUCCESS != r){
+		// fall back to start of kv range
+		memcpy(&pos, &bmk, sizeof(bmk));
+		r = cursor_get(&c, &pos, NULL, DB_SET_RANGE);
+	}
+
+	// nothing to do?
+	if(DB_SUCCESS != r || pos.size < kv->klen || memcmp(pos.data, bmk.data, kv->klen))
+		goto bail;
+
+	{
+		// stash a copy of the key
+		// fixme - do we need to make a copy?
+		uint8_t kbuf[pos.size];
+		memcpy(kbuf, pos.data, pos.size);
+
+		// update the bookmark
+		r = db_put(txn, DB_KVBM, &bmk, &pos, 0);
+		if(DB_SUCCESS != r)
+			goto bail;
+
+		// now go and fetch actual key & data
+		pos.data = kbuf;
+		assert(pos.size >= kv->klen);
+		val.data = NULL;
+		r = cursor_get(&c, &pos, &val, DB_SET_KEY);
+		assert(val.data);
+		if(DB_SUCCESS == r){
+			if(kv->flags & LG_KV_MAP_KEYS){
+				*key = graph_string_enc(kv->txn, pos.data + kv->klen, klen);
+			}else{
+				*key = pos.data + kv->klen;
+				*klen = pos.size - kv->klen;
+			}
+			if(kv->flags & LG_KV_MAP_DATA){
+				*data = graph_string_enc(kv->txn, val.data, dlen);
+			}else{
+				*data = val.data;
+				*dlen = val.size;
+			}
+			ret = 1;
+		}
+	}
+done:
+	cursor_close(&c);
+	return ret;
+
+bail:
+	ret = 0;
+	goto done;
+}
+
 kv_iter_t kv_iter(kv_t kv){
 	return kv_iter_pfx(kv, NULL, 0);
 }
 
 int kv_iter_next(kv_iter_t iter, void **key, size_t *klen, void **data, size_t *dlen){
-	int r = iter_next((iter_t)iter);
-	strID_t id;
-	int len;
+	const iter_t it = (iter_t)iter;
+	int r = iter_next(it);
 	const int ret = (DB_SUCCESS == r);
 	if(ret){
-		if(iter->kv->flags & LG_KV_MAP_KEYS){
-			len = iter->kv->klen;
-			decode(id, ((iter_t)iter)->key.data, len);
-			*key = graph_string(iter->kv->txn, id, klen);
+		const kv_t kv = iter->kv;
+		if(kv->flags & LG_KV_MAP_KEYS){
+			*key = graph_string_enc(kv->txn, it->key.data + kv->klen, klen);
 		}else{
-			*key = ((iter_t)iter)->key.data + iter->kv->klen;
-			*klen = ((iter_t)iter)->key.size - iter->kv->klen;
+			*key = it->key.data + kv->klen;
+			*klen = it->key.size - kv->klen;
 		}
-		if(iter->kv->flags & LG_KV_MAP_DATA){
-			len = 0;
-			decode(id, ((iter_t)iter)->data.data, len);
-			*data = graph_string(iter->kv->txn, id, dlen);
+		if(kv->flags & LG_KV_MAP_DATA){
+			*data = graph_string_enc(kv->txn, it->data.data, dlen);
 		}else{
-			*data = ((iter_t)iter)->data.data;
-			*dlen = ((iter_t)iter)->data.size;
+			*data = it->data.data;
+			*dlen = it->data.size;
 		}
 	}
+	return ret;
+}
+
+int kv_iter_seek(kv_iter_t iter, void *key, size_t klen){
+	// call this anyway to setup key buffer
+	int ret = _kv_setup_key(iter->kv, key, klen, 1);
+	assert(ret);
+
+	const kv_t kv = iter->kv;
+	// don't care if this fails - subsequent iter_next() will fail too
+	iter_seek((iter_t)iter, kv->key.data, kv->key.size);
+
 	return ret;
 }
 
@@ -1274,6 +1905,18 @@ graph_iter_t graph_edges_type(graph_txn_t txn, void *type, size_t tlen, logID_t 
 	return _graph_nodes_edges_type(txn, DB_EDGE_IDX, type, tlen, beforeID);
 }
 
+graph_iter_t graph_edges_type_value(graph_txn_t txn, void *type, size_t tlen, void *value, size_t vlen, logID_t beforeID){
+	strID_t typeID, valID;
+	uint8_t kbuf[esizeof(typeID) + esizeof(valID)];
+	size_t klen = 0;
+	graph_iter_t iter = NULL;
+	if(graph_string_lookup(txn, &typeID, type, tlen) && graph_string_lookup(txn, &valID, value, vlen)){
+		encode(typeID, kbuf, klen);
+		encode(valID, kbuf, klen);
+		iter = graph_iter_new(txn, DB_EDGE_IDX, kbuf, klen, beforeID);
+	}
+	return iter;
+}
 
 graph_iter_t graph_node_edges_in(graph_txn_t txn, node_t node, logID_t beforeID){
 	return _graph_entry_idx(txn, DB_TGTNODE_IDX, node->id, beforeID);
@@ -1371,9 +2014,13 @@ graph_t graph_open(const char * const path, const int flags, const int mode, con
 	int r;
 	graph_t g = malloc(sizeof(*g));
 	if(g){
-		// fixme? padsize hardcoded to 1gb
-		// explicitly disable DB_WRITEMAP - graph_txn_reset current depends on nested write txns
-		r = db_init((db_t)g, path, flags, mode, db_flags & ~DB_WRITEMAP, DBS, DB_INFO, 1<<30);
+		do{
+			// fixme? padsize hardcoded to 1gb
+			// explicitly disable DB_WRITEMAP - graph_txn_reset current depends on nested write txns
+			r = db_init((db_t)g, path, flags, mode, db_flags & ~DB_WRITEMAP, DBS, DB_INFO, 1<<30);
+
+			// fixme: endless retry on EINVAL - sometimes mdb_env_open gives us a busted env and txns don't work?
+		}while(EINVAL == r);
 		if(r){
 			free(g);
 			g = NULL;
@@ -1420,7 +2067,7 @@ static INLINE int _fetch_info(graph_txn_t txn){
 			buffer_t data, key;
 			r = cursor_get(&c, &key, &data, DB_GET_CURRENT);
 			assert(DB_SUCCESS == r);
-			int i = 0;
+			size_t i = 0;
 			decode(txn->prev_id, key.data, i);
 			decode(txn->prev_start, key.data, i);
 			decode(txn->prev_count, key.data, i);
@@ -1502,7 +2149,8 @@ void graph_txn_abort(graph_txn_t txn){
 }
 
 int graph_txn_reset(graph_txn_t txn){
-	int i, r = 1;
+	int r = 1;
+	unsigned int i;
 	graph_txn_t sub_txn = graph_txn_begin((graph_t)(((txn_t)txn)->db), txn, 0);
 	if(sub_txn){
 		// truncate all tables
@@ -1570,7 +2218,7 @@ static INLINE int _find_txn(graph_txn_t txn, txn_info_t info, logID_t beforeID){
 	int r =  txn_cursor_init(&c, (txn_t)txn, DB_TXNLOG);
 	assert(DB_SUCCESS == r);
 	r = cursor_get(&c, &key, &data, DB_SET_KEY);
-	int i;
+	size_t i;
 
 	if(DB_SUCCESS == r){
 again:
@@ -1725,6 +2373,35 @@ done:
 	return count;
 }
 
+// given logID, find txn that it was a part of
+// return beforeID that would include the entire txn
+logID_t graph_snap_id(graph_txn_t txn, logID_t id){
+	logID_t beforeID = txn->next_logID;
+	uint8_t kbuf[esizeof(txnID_t) + esizeof(logID_t) + esizeof(logID_t)];
+	buffer_t data, key = { 0, kbuf };
+	struct txn_info_t info;
+
+	// encode magic to query by logID
+	encode(0, kbuf, key.size);
+	encode(1, kbuf, key.size);
+	encode(id, kbuf, key.size);
+
+	struct cursor_t c;
+	int r = txn_cursor_init(&c, (txn_t)txn, DB_TXNLOG);
+	assert(DB_SUCCESS == r);
+
+	r = cursor_get(&c, &key, &data, DB_SET_KEY);
+	if(DB_SUCCESS == r){
+		int i = 0;
+		decode(info.id, key.data, i);
+		decode(info.start, key.data, i);
+		decode(info.count, key.data, i);
+		beforeID = info.start + info.count;
+	}
+	cursor_close(&c);
+	return beforeID;
+}
+
 char *__blob(graph_txn_t txn, uint64_t id, size_t *len, int db1){
 	assert(id);
 	buffer_t key = { sizeof(id), &id }, data;
@@ -1737,4 +2414,8 @@ char *__blob(graph_txn_t txn, uint64_t id, size_t *len, int db1){
 
 char *graph_string(graph_txn_t txn, strID_t id, size_t *len){
 	return id ? __blob(txn, id, len, DB_SCALAR) : ((*len = 0), NULL);
+}
+
+int graph_fd(graph_t g){
+	return g->db.fd;
 }
